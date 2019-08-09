@@ -6,9 +6,8 @@ jobs:
   build:
     # Job name is Greeting
     name: Greeting
-    # This job runs on macOS
-    runs-on: macos-latest
+    # This job runs on Ubuntu
+    runs-on: ubuntu-latest
     steps:
     # This step prints the time.
     - run: echo "Hi"
-    - run: sw_vers
