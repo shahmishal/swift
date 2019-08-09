@@ -11,4 +11,4 @@ jobs:
     steps:
     # This step prints the time.
     - run: echo "Hi"
-    - run: sw_vers
+    - run: sw_vers # macOS info
