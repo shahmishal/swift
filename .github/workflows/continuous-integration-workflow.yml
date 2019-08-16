@@ -15,4 +15,4 @@ jobs:
     - run: "ls -al /Applications/"
     - run: "system_profiler SPHardwareDataType"
     - run: "xcode-select -p"
-    - run: "sudo xcode-select -p /Applications/Xcode.app"
+    - run: "sudo xcode-select -s /Applications/Xcode_11_beta.app"
