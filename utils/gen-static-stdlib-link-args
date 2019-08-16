@@ -46,9 +46,9 @@ EOF
 # If libicu was compiled as part of the swift build then link the libs as normal
 function use_local_iculibs {
    read -d '' ICU_LIBS <<EOF
--licui18n
--licuuc
--licudata
+-licui18nswift
+-licuucswift
+-licudataswift
 EOF
 }
 
@@ -66,6 +66,8 @@ function write_linkfile {
 -latomic
 -lswiftImageInspectionShared
 $ICU_LIBS
+-lstdc++
+-lm
 -Xlinker
 -export-dynamic
 -Xlinker

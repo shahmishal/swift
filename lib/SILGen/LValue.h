@@ -51,22 +51,24 @@ struct LValueTypeData {
   CanType SubstFormalType;
 
   /// The lowered type of value that should be stored in the l-value.
-  /// Always an object type.
   ///
   /// On physical path components, projection yields an address of
   /// this type.  On logical path components, materialize yields an
   /// address of this type, set expects a value of this type, and
-  /// get yields a value of this type.
-  SILType TypeOfRValue;
+  /// get yields an object of this type.
+  CanType TypeOfRValue;
+
+  SGFAccessKind AccessKind;
 
   LValueTypeData() = default;
-  LValueTypeData(AbstractionPattern origFormalType, CanType substFormalType,
-                 SILType typeOfRValue)
+  LValueTypeData(SGFAccessKind accessKind, AbstractionPattern origFormalType,
+                 CanType substFormalType, CanType typeOfRValue)
     : OrigFormalType(origFormalType), SubstFormalType(substFormalType),
-      TypeOfRValue(typeOfRValue) {
-    assert(typeOfRValue.isObject());
+      TypeOfRValue(typeOfRValue), AccessKind(accessKind) {
     assert(substFormalType->isMaterializable());
   }
+
+  SGFAccessKind getAccessKind() const { return AccessKind; }
 };
 
 /// An l-value path component represents a chunk of the access path to
@@ -102,7 +104,7 @@ public:
     AddressorKind,              // var/subscript addressor
     CoroutineAccessorKind,      // coroutine accessor
     ValueKind,                  // random base pointer as an lvalue
-    KeyPathApplicationKind,     // applying a key path
+    PhysicalKeyPathApplicationKind, // applying a key path
 
     // Logical LValue kinds
     GetterSetterKind,           // property or subscript getter/setter
@@ -111,6 +113,7 @@ public:
     AutoreleasingWritebackKind, // autorelease pointer on set
     WritebackPseudoKind,        // a fake component to customize writeback
     OpenNonOpaqueExistentialKind,  // opened class or metatype existential
+    LogicalKeyPathApplicationKind, // applying a key path
     // Translation LValue kinds (a subtype of logical)
     OrigToSubstKind,            // generic type substitution
     SubstToOrigKind,            // generic type substitution
@@ -157,16 +160,17 @@ public:
   TranslationPathComponent &asTranslation();
   const TranslationPathComponent &asTranslation() const;
 
+  /// Apply this component as a projection to the given base component,
+  /// producing something usable as the base of the next component.
+  virtual ManagedValue project(SILGenFunction &SGF,
+                               SILLocation loc,
+                               ManagedValue base) && = 0;
+
   /// Is this some form of open-existential component?
   bool isOpenExistential() const {
     return getKind() == OpenOpaqueExistentialKind ||
            getKind() == OpenNonOpaqueExistentialKind;
   }
-
-  /// Return the appropriate access kind to use when producing the
-  /// base value.
-  virtual AccessKind getBaseAccessKind(SILGenFunction &SGF,
-                                       AccessKind accessKind) const = 0;
 
   /// Is loading a value from this component guaranteed to have no observable
   /// side effects?
@@ -179,13 +183,16 @@ public:
 
   /// Returns the logical type-as-rvalue of the value addressed by the
   /// component.  This is always an object type, never an address.
-  SILType getTypeOfRValue() const { return TypeData.TypeOfRValue; }
+  SILType getTypeOfRValue() const {
+    return SILType::getPrimitiveObjectType(TypeData.TypeOfRValue);
+  }
   AbstractionPattern getOrigFormalType() const {
     return TypeData.OrigFormalType;
   }
   CanType getSubstFormalType() const { return TypeData.SubstFormalType; }
 
   const LValueTypeData &getTypeData() const { return TypeData; }
+  SGFAccessKind getAccessKind() const { return getTypeData().getAccessKind(); }
 
   KindTy getKind() const { return Kind; }
 
@@ -196,6 +203,8 @@ public:
 /// An abstract class for "physical" path components, i.e. path
 /// components that can be accessed as address manipulations.  See the
 /// comment for PathComponent for more information.
+///
+/// The only operation on this component is `project`.
 class PhysicalPathComponent : public PathComponent {
   virtual void _anchor() override;
 
@@ -203,20 +212,6 @@ protected:
   PhysicalPathComponent(LValueTypeData typeData, KindTy Kind)
     : PathComponent(typeData, Kind) {
     assert(isPhysical() && "PhysicalPathComponent Kind isn't physical");
-  }
-
-public:
-  /// Derive the address of this component given the address of the base.
-  ///
-  /// \param base - always an address, but possibly an r-value
-  virtual ManagedValue offset(SILGenFunction &SGF,
-                              SILLocation loc,
-                              ManagedValue base,
-                              AccessKind accessKind) && = 0;
-
-  AccessKind getBaseAccessKind(SILGenFunction &SGF,
-                               AccessKind accessKind) const override {
-    return accessKind;
   }
 };
 
@@ -233,18 +228,16 @@ inline const PhysicalPathComponent &PathComponent::asPhysical() const {
 /// components that require getter/setter methods to access.  See the
 /// comment for PathComponent for more information.
 class LogicalPathComponent : public PathComponent {
-  virtual void _anchor();
-
 protected:
   LogicalPathComponent(LValueTypeData typeData, KindTy Kind)
     : PathComponent(typeData, Kind) {
     assert(isLogical() && "LogicalPathComponent Kind isn't logical");
   }
 
-  /// Materialize this component into a temporary and return the temporary's
-  /// address.
-  ManagedValue materializeIntoTemporary(SILGenFunction &SGF, SILLocation loc,
-                                        ManagedValue base) &&;
+  /// Read the value of this component, producing the right kind of result
+  /// for the given access kind (which is always some kind of read access).
+  ManagedValue projectForRead(SILGenFunction &SGF, SILLocation loc,
+                              ManagedValue base, SGFAccessKind kind) &&;
 
 public:
   /// Clone the path component onto the heap.
@@ -263,25 +256,20 @@ public:
   virtual RValue get(SILGenFunction &SGF, SILLocation loc,
                      ManagedValue base, SGFContext c) && = 0;
 
+  /// The default implementation of project performs a get or materializes
+  /// to a temporary as necessary.
+  ManagedValue project(SILGenFunction &SGF, SILLocation loc,
+                       ManagedValue base) && override;
+
   struct AccessedStorage {
     AbstractStorageDecl *Storage;
     bool IsSuper;
-    const RValue *Indices;
+    const PreparedArguments *Indices;
     Expr *IndexExprForDiagnostics;
   };
 
   /// Get the storage accessed by this component.
   virtual Optional<AccessedStorage> getAccessedStorage() const = 0;
-
-
-  /// Materialize the storage into memory.  If the access is for
-  /// mutation, ensure that modifications to the memory will
-  /// eventually be reflected in the original storage.
-  ///
-  /// \param base - always an address, but possibly an r-value
-  virtual ManagedValue getMaterialized(SILGenFunction &SGF, SILLocation loc,
-                                       ManagedValue base,
-                                       AccessKind accessKind) &&;
 
   /// Perform a writeback on the property.
   ///
@@ -311,12 +299,6 @@ protected:
   }
 
 public:
-  AccessKind getBaseAccessKind(SILGenFunction &SGF,
-                               AccessKind kind) const override {
-    // Always use the same access kind for the base.
-    return kind;
-  }
-
   Optional<AccessedStorage> getAccessedStorage() const override {
     return None;
   }
@@ -362,10 +344,10 @@ public:
   LValue &operator=(const LValue &) = delete;
   LValue &operator=(LValue &&) = default;
 
-  static LValue forValue(ManagedValue value,
+  static LValue forValue(SGFAccessKind accessKind, ManagedValue value,
                          CanType substFormalType);
 
-  static LValue forAddress(ManagedValue address,
+  static LValue forAddress(SGFAccessKind accessKind, ManagedValue address,
                            Optional<SILAccessEnforcement> enforcement,
                            AbstractionPattern origFormalType,
                            CanType substFormalType);
@@ -431,8 +413,9 @@ public:
   }
 
   void addNonMemberVarComponent(SILGenFunction &SGF, SILLocation loc,
-                                VarDecl *var, Optional<SubstitutionMap> subs,
+                                VarDecl *var, SubstitutionMap subs,
                                 LValueOptions options,
+                                SGFAccessKind accessKind,
                                 AccessStrategy strategy,
                                 CanType formalRValueType);
 
@@ -442,9 +425,10 @@ public:
                           SubstitutionMap subs,
                           LValueOptions options,
                           bool isSuper,
+                          SGFAccessKind accessKind,
                           AccessStrategy accessStrategy,
                           CanType formalRValueType,
-                          RValue &&indices,
+                          PreparedArguments &&indices,
                           Expr *indexExprForDiagnostics);
 
   void addMemberVarComponent(SILGenFunction &SGF, SILLocation loc,
@@ -452,18 +436,22 @@ public:
                              SubstitutionMap subs,
                              LValueOptions options,
                              bool isSuper,
+                             SGFAccessKind accessKind,
                              AccessStrategy accessStrategy,
-                             CanType formalRValueType);
+                             CanType formalRValueType,
+                             bool isOnSelf = false);
 
   void addMemberSubscriptComponent(SILGenFunction &SGF, SILLocation loc,
                                    SubscriptDecl *subscript,
                                    SubstitutionMap subs,
                                    LValueOptions options,
                                    bool isSuper,
+                                   SGFAccessKind accessKind,
                                    AccessStrategy accessStrategy,
                                    CanType formalRValueType,
-                                   RValue &&indices,
-                                   Expr *indexExprForDiagnostics = nullptr);
+                                   PreparedArguments &&indices,
+                                   Expr *indexExprForDiagnostics,
+                                   bool isOnSelfParameter = false);
 
   /// Add a subst-to-orig reabstraction component.  That is, given
   /// that this l-value trafficks in values following the substituted
@@ -491,10 +479,15 @@ public:
     return Path.back()->getTypeData();
   }
 
+  /// Return the access kind that this l-value was emitted for.
+  SGFAccessKind getAccessKind() const { return getTypeData().getAccessKind(); }
+
   /// Returns the type-of-rvalue of the logical object referenced by
   /// this l-value.  Note that this may differ significantly from the
   /// type of l-value.
-  SILType getTypeOfRValue() const { return getTypeData().TypeOfRValue; }
+  SILType getTypeOfRValue() const {
+    return SILType::getPrimitiveObjectType(getTypeData().TypeOfRValue);
+  }
   CanType getSubstFormalType() const { return getTypeData().SubstFormalType; }
   AbstractionPattern getOrigFormalType() const {
     return getTypeData().OrigFormalType;
@@ -504,8 +497,9 @@ public:
   /// access that would conflict with this the accesses begun by this
   /// LValue. This is a best-effort attempt; it may return false in cases
   /// where the two LValues do not conflict.
-  bool isObviouslyNonConflicting(const LValue &other, AccessKind selfAccess,
-                                 AccessKind otherAccess);
+  bool isObviouslyNonConflicting(const LValue &other,
+                                 SGFAccessKind selfAccess,
+                                 SGFAccessKind otherAccess);
 
   void dump() const;
   void dump(raw_ostream &os, unsigned indent = 0) const;
@@ -532,7 +526,6 @@ struct LLVM_LIBRARY_VISIBILITY ExclusiveBorrowFormalAccess : FormalAccess {
   ExclusiveBorrowFormalAccess &
   operator=(ExclusiveBorrowFormalAccess &&) = default;
 
-  ExclusiveBorrowFormalAccess() = default;
   ExclusiveBorrowFormalAccess(SILLocation loc,
                               std::unique_ptr<LogicalPathComponent> &&comp,
                               ManagedValue base,

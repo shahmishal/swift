@@ -11,14 +11,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILFunctionBuilder.h"
-
+#include "swift/AST/Availability.h"
+#include "swift/AST/Decl.h"
 using namespace swift;
 
 SILFunction *SILFunctionBuilder::getOrCreateFunction(
     SILLocation loc, StringRef name, SILLinkage linkage,
     CanSILFunctionType type, IsBare_t isBareSILFunction,
     IsTransparent_t isTransparent, IsSerialized_t isSerialized,
-    ProfileCounter entryCount, IsThunk_t isThunk, SubclassScope subclassScope) {
+    IsDynamicallyReplaceable_t isDynamic, ProfileCounter entryCount,
+    IsThunk_t isThunk, SubclassScope subclassScope) {
   assert(!type->isNoEscape() && "Function decls always have escaping types.");
   if (auto fn = mod.lookUpFunction(name)) {
     assert(fn->getLoweredFunctionType() == type);
@@ -29,41 +31,17 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
 
   auto fn = SILFunction::create(mod, linkage, name, type, nullptr, loc,
                                 isBareSILFunction, isTransparent, isSerialized,
-                                entryCount, isThunk, subclassScope);
+                                entryCount, isDynamic, IsNotExactSelfClass,
+                                isThunk, subclassScope);
   fn->setDebugScope(new (mod) SILDebugScope(loc, fn));
   return fn;
 }
 
-static bool verifySILSelfParameterType(SILDeclRef DeclRef, SILFunction *F,
-                                       CanSILFunctionType FTy) {
-  SILModule &M = F->getModule();
-  SILParameterInfo PInfo = FTy->getSelfParameter();
-  CanType CTy = PInfo.getType();
-  SILType Ty = SILType::getPrimitiveObjectType(CTy);
+void SILFunctionBuilder::addFunctionAttributes(SILFunction *F,
+                                               DeclAttributes &Attrs,
+                                               SILModule &M,
+                                               SILDeclRef constant) {
 
-  // We do not care about trivial parameters (for now). There seem to be
-  // cases where we lower them as unowned.
-  //
-  // *NOTE* We do not run this check when we have a generic type since
-  // *generic types do not have type lowering and are always treated as
-  // *non-trivial since we do not know the type.
-  if (CTy->hasArchetype() || CTy->hasTypeParameter() ||
-      M.getTypeLowering(Ty).isTrivial())
-    return true;
-
-  // If this function is a constructor or destructor, bail. These have @owned
-  // parameters.
-  if (DeclRef.isConstructor() || DeclRef.isDestructor())
-    return true;
-
-  // Otherwise, if this function type has a guaranteed self parameter type,
-  // make sure that we have a +0 self param.
-  return !FTy->getExtInfo().hasGuaranteedSelfParam() || PInfo.isGuaranteed() ||
-         PInfo.isIndirectMutating();
-}
-
-static void addFunctionAttributes(SILFunction *F, DeclAttributes &Attrs,
-                                  SILModule &M) {
   for (auto *A : Attrs.getAttributes<SemanticsAttr>())
     F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
 
@@ -86,19 +64,52 @@ static void addFunctionAttributes(SILFunction *F, DeclAttributes &Attrs,
   if (Attrs.hasAttribute<SILGenNameAttr>() || Attrs.hasAttribute<CDeclAttr>())
     F->setHasCReferences(true);
 
-  if (Attrs.hasAttribute<WeakLinkedAttr>())
-    F->setWeakLinked();
+  // Propagate @_dynamicReplacement(for:).
+  if (constant.isNull())
+    return;
+  auto *decl = constant.getDecl();
+
+  // Only emit replacements for the objc entry point of objc methods.
+  if (decl->isObjC() &&
+      F->getLoweredFunctionType()->getExtInfo().getRepresentation() !=
+          SILFunctionTypeRepresentation::ObjCMethod)
+    return;
+
+  auto *replacedFuncAttr = Attrs.getAttribute<DynamicReplacementAttr>();
+  if (!replacedFuncAttr)
+    return;
+
+  auto *replacedDecl = replacedFuncAttr->getReplacedFunction();
+  assert(replacedDecl);
+
+  if (decl->isObjC()) {
+    F->setObjCReplacement(replacedDecl);
+    return;
+  }
+
+  if (!constant.canBeDynamicReplacement())
+    return;
+
+  SILDeclRef declRef(replacedDecl, constant.kind, false);
+  auto *replacedFunc =
+      getOrCreateFunction(replacedDecl, declRef, NotForDefinition);
+
+  assert(replacedFunc->getLoweredFunctionType() ==
+             F->getLoweredFunctionType() ||
+         replacedFunc->getLoweredFunctionType()->hasOpaqueArchetype());
+
+  F->setDynamicallyReplacedFunction(replacedFunc);
 }
 
 SILFunction *
 SILFunctionBuilder::getOrCreateFunction(SILLocation loc, SILDeclRef constant,
                                         ForDefinition_t forDefinition,
                                         ProfileCounter entryCount) {
-  auto name = constant.mangle();
+  auto nameTmp = constant.mangle();
   auto constantType = mod.Types.getConstantFunctionType(constant);
   SILLinkage linkage = constant.getLinkage(forDefinition);
 
-  if (auto fn = mod.lookUpFunction(name)) {
+  if (auto fn = mod.lookUpFunction(nameTmp)) {
     assert(fn->getLoweredFunctionType() == constantType);
     assert(fn->getLinkage() == linkage ||
            (forDefinition == ForDefinition_t::NotForDefinition &&
@@ -129,10 +140,18 @@ SILFunctionBuilder::getOrCreateFunction(SILLocation loc, SILDeclRef constant,
   else if (constant.isAlwaysInline())
     inlineStrategy = AlwaysInline;
 
-  auto *F =
-      SILFunction::create(mod, linkage, name, constantType, nullptr, None,
-                          IsNotBare, IsTrans, IsSer, entryCount, IsNotThunk,
-                          constant.getSubclassScope(), inlineStrategy, EK);
+  StringRef name = mod.allocateCopy(nameTmp);
+  IsDynamicallyReplaceable_t IsDyn = IsNotDynamic;
+  if (constant.isDynamicallyReplaceable()) {
+    IsDyn = IsDynamic;
+    IsTrans = IsNotTransparent;
+  }
+
+  auto *F = SILFunction::create(mod, linkage, name, constantType, nullptr, None,
+                                IsNotBare, IsTrans, IsSer, entryCount, IsDyn,
+                                IsNotExactSelfClass,
+                                IsNotThunk, constant.getSubclassScope(),
+                                inlineStrategy, EK);
   F->setDebugScope(new (mod) SILDebugScope(loc, F));
 
   F->setGlobalInit(constant.isGlobal());
@@ -142,23 +161,15 @@ SILFunctionBuilder::getOrCreateFunction(SILLocation loc, SILDeclRef constant,
     if (constant.isForeign && decl->hasClangNode())
       F->setClangNodeOwner(decl);
 
+    if (decl->isWeakImported(/*forModule=*/nullptr, availCtx))
+      F->setWeakLinked();
+
     if (auto *accessor = dyn_cast<AccessorDecl>(decl)) {
       auto *storage = accessor->getStorage();
       // Add attributes for e.g. computed properties.
       addFunctionAttributes(F, storage->getAttrs(), mod);
     }
-    addFunctionAttributes(F, decl->getAttrs(), mod);
-  }
-
-  // If this function has a self parameter, make sure that it has a +0 calling
-  // convention. This cannot be done for general function types, since
-  // function_ref's SILFunctionTypes do not have archetypes associated with
-  // it.
-  CanSILFunctionType FTy = F->getLoweredFunctionType();
-  if (FTy->hasSelfParam()) {
-    (void)&verifySILSelfParameterType;
-    assert(verifySILSelfParameterType(constant, F, FTy) &&
-           "Invalid signature for SIL Self parameter type");
+    addFunctionAttributes(F, decl->getAttrs(), mod, constant);
   }
 
   return F;
@@ -167,21 +178,25 @@ SILFunctionBuilder::getOrCreateFunction(SILLocation loc, SILDeclRef constant,
 SILFunction *SILFunctionBuilder::getOrCreateSharedFunction(
     SILLocation loc, StringRef name, CanSILFunctionType type,
     IsBare_t isBareSILFunction, IsTransparent_t isTransparent,
-    IsSerialized_t isSerialized, ProfileCounter entryCount, IsThunk_t isThunk) {
+    IsSerialized_t isSerialized, ProfileCounter entryCount, IsThunk_t isThunk,
+    IsDynamicallyReplaceable_t isDynamic) {
   return getOrCreateFunction(loc, name, SILLinkage::Shared, type,
                              isBareSILFunction, isTransparent, isSerialized,
-                             entryCount, isThunk, SubclassScope::NotApplicable);
+                             isDynamic, entryCount, isThunk,
+                             SubclassScope::NotApplicable);
 }
 
 SILFunction *SILFunctionBuilder::createFunction(
     SILLinkage linkage, StringRef name, CanSILFunctionType loweredType,
     GenericEnvironment *genericEnv, Optional<SILLocation> loc,
     IsBare_t isBareSILFunction, IsTransparent_t isTrans,
-    IsSerialized_t isSerialized, ProfileCounter entryCount, IsThunk_t isThunk,
-    SubclassScope subclassScope, Inline_t inlineStrategy, EffectsKind EK,
-    SILFunction *InsertBefore, const SILDebugScope *DebugScope) {
+    IsSerialized_t isSerialized, IsDynamicallyReplaceable_t isDynamic,
+    ProfileCounter entryCount, IsThunk_t isThunk, SubclassScope subclassScope,
+    Inline_t inlineStrategy, EffectsKind EK, SILFunction *InsertBefore,
+    const SILDebugScope *DebugScope) {
   return SILFunction::create(mod, linkage, name, loweredType, genericEnv, loc,
                              isBareSILFunction, isTrans, isSerialized,
-                             entryCount, isThunk, subclassScope, inlineStrategy,
-                             EK, InsertBefore, DebugScope);
+                             entryCount, isDynamic, IsNotExactSelfClass,
+                             isThunk, subclassScope,
+                             inlineStrategy, EK, InsertBefore, DebugScope);
 }

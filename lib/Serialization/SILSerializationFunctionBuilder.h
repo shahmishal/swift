@@ -30,8 +30,12 @@ public:
     return builder.createFunction(
         SILLinkage::Private, name, type.getAs<SILFunctionType>(), nullptr,
         loc, IsNotBare, IsNotTransparent,
-        IsNotSerialized, ProfileCounter(), IsNotThunk,
+        IsNotSerialized, IsNotDynamic, ProfileCounter(), IsNotThunk,
         SubclassScope::NotApplicable);
+  }
+
+  void setHasOwnership(SILFunction *f, bool newValue) {
+    builder.setHasOwnership(f, newValue);
   }
 };
 

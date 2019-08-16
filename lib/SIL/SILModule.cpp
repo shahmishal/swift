@@ -11,28 +11,29 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-module"
-#include "swift/Serialization/SerializedSILLoader.h"
+#include "swift/SIL/SILModule.h"
+#include "Linker.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ProtocolConformance.h"
-#include "swift/SIL/FormalLinkage.h"
-#include "swift/SIL/SILDebugScope.h"
-#include "swift/SIL/SILModule.h"
-#include "swift/Strings.h"
-#include "Linker.h"
-#include "swift/SIL/SILVisitor.h"
-#include "swift/SIL/SILValue.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/SIL/FormalLinkage.h"
+#include "swift/SIL/Notifications.h"
+#include "swift/SIL/SILDebugScope.h"
+#include "swift/SIL/SILValue.h"
+#include "swift/SIL/SILVisitor.h"
+#include "swift/Serialization/SerializedSILLoader.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/YAMLTraits.h"
 #include <functional>
 using namespace swift;
 using namespace Lowering;
 
-class SILModule::SerializationCallback : public SerializedSILLoader::Callback {
+class SILModule::SerializationCallback final
+    : public DeserializationNotificationHandler {
   void didDeserialize(ModuleDecl *M, SILFunction *fn) override {
     updateLinkage(fn);
   }
@@ -83,19 +84,21 @@ class SILModule::SerializationCallback : public SerializedSILLoader::Callback {
     }
   }
 
-  void didDeserializeFunctionBody(ModuleDecl *M, SILFunction *fn) override {
-    // Callbacks are currently applied in the order they are registered.
-    for (auto callBack : fn->getModule().getDeserializationCallbacks())
-      callBack(M, fn);
+  StringRef getName() const override {
+    return "SILModule::SerializationCallback";
   }
 };
 
 SILModule::SILModule(ModuleDecl *SwiftModule, SILOptions &Options,
                      const DeclContext *associatedDC, bool wholeModule)
     : TheSwiftModule(SwiftModule), AssociatedDeclContext(associatedDC),
-      Stage(SILStage::Raw), Callback(new SILModule::SerializationCallback()),
-      wholeModule(wholeModule), Options(Options), serialized(false),
-      SerializeSILAction(), Types(*this) {}
+      Stage(SILStage::Raw), wholeModule(wholeModule), Options(Options),
+      serialized(false), SerializeSILAction(), Types(*this) {
+  // We always add the base SILModule serialization callback.
+  std::unique_ptr<DeserializationNotificationHandler> callback(
+      new SILModule::SerializationCallback());
+  deserializationNotificationHandlers.add(std::move(callback));
+}
 
 SILModule::~SILModule() {
   // Decrement ref count for each SILGlobalVariable with static initializers.
@@ -108,8 +111,10 @@ SILModule::~SILModule() {
   // need to worry about sil_witness_tables since witness tables reference each
   // other via protocol conformances and sil_vtables don't reference each other
   // at all.
-  for (SILFunction &F : *this)
+  for (SILFunction &F : *this) {
     F.dropAllReferences();
+    F.dropDynamicallyReplacedFunction();
+  }
 }
 
 std::unique_ptr<SILModule>
@@ -139,20 +144,6 @@ void SILModule::deallocateInst(SILInstruction *I) {
 }
 
 SILWitnessTable *
-SILModule::createWitnessTableDeclaration(ProtocolConformance *C,
-                                         SILLinkage linkage) {
-  // If we are passed in a null conformance (a valid value), just return nullptr
-  // since we cannot map a witness table to it.
-  if (!C)
-    return nullptr;
-
-  // Extract the base NormalProtocolConformance.
-  NormalProtocolConformance *NormalC = C->getRootNormalConformance();
-
-  return SILWitnessTable::create(*this, linkage, NormalC);
-}
-
-SILWitnessTable *
 SILModule::lookUpWitnessTable(ProtocolConformanceRef C,
                               bool deserializeLazily) {
   // If we have an abstract conformance passed in (a legal value), just return
@@ -168,9 +159,11 @@ SILModule::lookUpWitnessTable(const ProtocolConformance *C,
                               bool deserializeLazily) {
   assert(C && "null conformance passed to lookUpWitnessTable");
 
-  const NormalProtocolConformance *NormalC = C->getRootNormalConformance();
+  SILWitnessTable *wtable;
+
+  auto rootC = C->getRootConformance();
   // Attempt to lookup the witness table from the table.
-  auto found = WitnessTableMap.find(NormalC);
+  auto found = WitnessTableMap.find(rootC);
   if (found == WitnessTableMap.end()) {
 #ifndef NDEBUG
     // Make sure that all witness tables are in the witness table lookup
@@ -181,20 +174,28 @@ SILModule::lookUpWitnessTable(const ProtocolConformance *C,
     // is the potential for a conformance without a witness table to be passed
     // to this function.
     for (SILWitnessTable &WT : witnessTables)
-      assert(WT.getConformance() != NormalC &&
+      assert(WT.getConformance() != rootC &&
              "Found witness table that is not"
              " in the witness table lookup cache.");
 #endif
-    return nullptr;
+
+    // If we don't have a witness table and we're not going to try
+    // deserializing it, do not create a declaration.
+    if (!deserializeLazily)
+      return nullptr;
+
+    auto linkage = getLinkageForProtocolConformance(rootC, NotForDefinition);
+    wtable = SILWitnessTable::create(*this, linkage,
+                                 const_cast<RootProtocolConformance *>(rootC));
+  } else {
+    wtable = found->second;
+    assert(wtable != nullptr && "Should never map a conformance to a null witness"
+                            " table.");
+
+    // If we have a definition, return it.
+    if (wtable->isDefinition())
+      return wtable;
   }
-
-  SILWitnessTable *wtable = found->second;
-  assert(wtable != nullptr && "Should never map a conformance to a null witness"
-                          " table.");
-
-  // If we have a definition, return it.
-  if (wtable->isDefinition())
-    return wtable;
 
   // If the module is at or past the Lowered stage, then we can't do any
   // further deserialization, since pre-IRGen SIL lowering changes the types
@@ -203,7 +204,7 @@ SILModule::lookUpWitnessTable(const ProtocolConformance *C,
   case SILStage::Canonical:
   case SILStage::Raw:
     break;
-    
+
   case SILStage::Lowered:
     return wtable;
   }
@@ -255,7 +256,7 @@ SILModule::createDefaultWitnessTableDeclaration(const ProtocolDecl *Protocol,
 }
 
 void SILModule::deleteWitnessTable(SILWitnessTable *Wt) {
-  NormalProtocolConformance *Conf = Wt->getConformance();
+  auto Conf = Wt->getConformance();
   assert(lookUpWitnessTable(Conf, false) == Wt);
   WitnessTableMap.erase(Conf);
   witnessTables.erase(Wt);
@@ -271,7 +272,7 @@ const IntrinsicInfo &SILModule::getIntrinsicInfo(Identifier ID) {
 
   // Otherwise, lookup the ID and Type and store them in the map.
   StringRef NameRef = getBuiltinBaseName(getASTContext(), ID.str(), Info.Types);
-  Info.ID = (llvm::Intrinsic::ID)getLLVMIntrinsicID(NameRef);
+  Info.ID = getLLVMIntrinsicID(NameRef);
 
   return Info;
 }
@@ -303,13 +304,11 @@ const BuiltinInfo &SILModule::getBuiltinInfo(Identifier ID) {
     Info.ID = BuiltinValueKind::AtomicStore;
   else if (OperationName.startswith("allocWithTailElems_"))
     Info.ID = BuiltinValueKind::AllocWithTailElems;
-  else {
-    // Switch through the rest of builtins.
-#define BUILTIN(Id, Name, Attrs) \
-    if (OperationName == Name) { Info.ID = BuiltinValueKind::Id; } else
+  else
+    Info.ID = llvm::StringSwitch<BuiltinValueKind>(OperationName)
+#define BUILTIN(id, name, attrs) .Case(name, BuiltinValueKind::id)
 #include "swift/AST/Builtins.def"
-    /* final "else" */ { Info.ID = BuiltinValueKind::None; }
-  }
+      .Default(BuiltinValueKind::None);
 
   return Info;
 }
@@ -435,6 +434,7 @@ void SILModule::eraseFunction(SILFunction *F) {
   // This opens dead-function-removal opportunities for called functions.
   // (References are not needed anymore.)
   F->dropAllReferences();
+  F->dropDynamicallyReplacedFunction();
 }
 
 void SILModule::invalidateFunctionInSILCache(SILFunction *F) {
@@ -469,13 +469,13 @@ SILVTable *SILModule::lookUpVTable(const ClassDecl *C) {
 SerializedSILLoader *SILModule::getSILLoader() {
   // If the SILLoader is null, create it.
   if (!SILLoader)
-    SILLoader = SerializedSILLoader::create(getASTContext(), this,
-                                            Callback.get());
+    SILLoader = SerializedSILLoader::create(
+        getASTContext(), this, &deserializationNotificationHandlers);
   // Return the SerializedSILLoader.
   return SILLoader.get();
 }
 
-/// \brief Given a conformance \p C and a protocol requirement \p Requirement,
+/// Given a conformance \p C and a protocol requirement \p Requirement,
 /// search the witness table for the conformance and return the witness thunk
 /// for the requirement.
 std::pair<SILFunction *, SILWitnessTable *>
@@ -510,7 +510,7 @@ SILModule::lookUpFunctionInWitnessTable(ProtocolConformanceRef C,
   return std::make_pair(nullptr, nullptr);
 }
 
-/// \brief Given a protocol \p Protocol and a requirement \p Requirement,
+/// Given a protocol \p Protocol and a requirement \p Requirement,
 /// search the protocol's default witness table and return the default
 /// witness thunk for the requirement.
 std::pair<SILFunction *, SILDefaultWitnessTable *>
@@ -534,16 +534,16 @@ SILModule::lookUpFunctionInDefaultWitnessTable(const ProtocolDecl *Protocol,
 
   // Okay, we found the correct default witness table. Now look for the method.
   for (auto &Entry : Ret->getEntries()) {
-    // Ignore dummy entries semitted for non-method requirements, as well as
+    // Ignore dummy entries emitted for non-method requirements, as well as
     // requirements without default implementations.
-    if (!Entry.isValid())
+    if (!Entry.isValid() || Entry.getKind() != SILWitnessTable::Method)
       continue;
 
     // Check if this is the member we were looking for.
-    if (Entry.getRequirement() != Requirement)
+    if (Entry.getMethodWitness().Requirement != Requirement)
       continue;
 
-    return std::make_pair(Entry.getWitness(), Ret);
+    return std::make_pair(Entry.getMethodWitness().Witness, Ret);
   }
 
   // This requirement doesn't have a default implementation.
@@ -569,25 +569,17 @@ lookUpFunctionInVTable(ClassDecl *Class, SILDeclRef Member) {
   return nullptr;
 }
 
-void SILModule::registerDeserializationCallback(
-    SILFunctionBodyCallback callBack) {
-  if (std::find(DeserializationCallbacks.begin(),
-                DeserializationCallbacks.end(), callBack)
-      == DeserializationCallbacks.end())
-    DeserializationCallbacks.push_back(callBack);
+void SILModule::registerDeserializationNotificationHandler(
+    std::unique_ptr<DeserializationNotificationHandler> &&handler) {
+  deserializationNotificationHandlers.add(std::move(handler));
 }
 
-ArrayRef<SILModule::SILFunctionBodyCallback>
-SILModule::getDeserializationCallbacks() {
-  return DeserializationCallbacks;
-}
-
-void SILModule::
-registerDeleteNotificationHandler(DeleteNotificationHandler* Handler) {
+void SILModule::registerDeleteNotificationHandler(
+    DeleteNotificationHandler *handler) {
   // Ask the handler (that can be an analysis, a pass, or some other data
   // structure) if it wants to receive delete notifications.
-  if (Handler->needsNotifications()) {
-    NotificationHandlers.insert(Handler);
+  if (handler->needsNotifications()) {
+    NotificationHandlers.insert(handler);
   }
 }
 
@@ -638,14 +630,10 @@ shouldSerializeEntitiesAssociatedWithDeclContext(const DeclContext *DC) const {
   return false;
 }
 
-/// Returns true if it is the OnoneSupport module.
-bool SILModule::isOnoneSupportModule() const {
-  return getSwiftModule()->getName().str() == SWIFT_ONONE_SUPPORT;
-}
-
 /// Returns true if it is the optimized OnoneSupport module.
 bool SILModule::isOptimizedOnoneSupportModule() const {
-  return getOptions().shouldOptimize() && isOnoneSupportModule();
+  return getOptions().shouldOptimize() &&
+         getSwiftModule()->isOnoneSupportModule();
 }
 
 void SILModule::setSerializeSILAction(SILModule::ActionCallback Action) {
@@ -669,6 +657,10 @@ void SILModule::setOptRecordStream(
     std::unique_ptr<llvm::raw_ostream> &&RawStream) {
   OptRecordStream = std::move(Stream);
   OptRecordRawStream = std::move(RawStream);
+}
+
+bool SILModule::isStdlibModule() const {
+  return TheSwiftModule->isStdlibModule();
 }
 
 SILProperty *SILProperty::create(SILModule &M,

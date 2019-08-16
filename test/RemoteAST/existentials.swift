@@ -1,11 +1,12 @@
-// UNSUPPORTED: linux
-// <rdar://problem/42793848>
 // RUN: %target-swift-remoteast-test %s | %FileCheck %s
 
 // REQUIRES: swift-remoteast-test
 
 @_silgen_name("printDynamicTypeAndAddressForExistential")
 func printDynamicTypeAndAddressForExistential<T>(_: T)
+
+@_silgen_name("stopRemoteAST")
+func stopRemoteAST()
 
 struct MyStruct<T, U, V> {
   let x: T
@@ -46,3 +47,10 @@ enum MyError : Error {
 // CHECK-NEXT: MyError
 let q : Error  = MyError.a
 printDynamicTypeAndAddressForExistential(q)
+
+// Case five: existential metatypes.
+// CHECK-NEXT: Any.Type
+let metatype : Any.Type = Any.self
+printDynamicTypeAndAddressForExistential(metatype)
+
+stopRemoteAST()

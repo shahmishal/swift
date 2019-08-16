@@ -32,10 +32,13 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "access-enforcement-selection"
+#include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILUndef.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Analysis/ClosureScope.h"
+#include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 
 using namespace swift;
@@ -68,7 +71,6 @@ struct AddressCapture {
 
   AddressCapture(Operand &oper)
       : site(oper.getUser()), calleeArgIdx(site.getCalleeArgIndex(oper)) {
-    assert(isa<PartialApplyInst>(site));
     if (site.getOrigCalleeConv().getSILArgumentConvention(calleeArgIdx)
         != SILArgumentConvention::Indirect_InoutAliasable) {
       site = ApplySite();
@@ -105,6 +107,10 @@ public:
   void recordCapture(AddressCapture capture) {
     LLVM_DEBUG(llvm::dbgs() << "Dynamic Capture: " << capture);
 
+    // *NOTE* For dynamically replaceable local functions, getCalleeFunction()
+    // returns nullptr. This assert verifies the assumption that a captured
+    // local variable can never be promoted to capture-by-address for
+    // dynamically replaceable local functions.
     auto callee = capture.site.getCalleeFunction();
     assert(callee && "cannot locate function ref for nonescaping closure");
 
@@ -254,7 +260,8 @@ static void checkUsesOfAccess(BeginAccessInst *access) {
   for (auto *use : access->getUses()) {
     auto user = use->getUser();
     assert(!isa<BeginAccessInst>(user));
-    assert(!isa<PartialApplyInst>(user));
+    assert(!isa<PartialApplyInst>(user) ||
+           onlyUsedByAssignByWrapper(cast<PartialApplyInst>(user)));
   }
 #endif
 }
@@ -272,8 +279,16 @@ void SelectEnforcement::analyzeProjection(ProjectBoxInst *projection) {
 
       continue;
     }
-    if (isa<PartialApplyInst>(user))
-      Captures.emplace_back(AddressCapture(*use));
+    // Handle both partial applies and directly applied non-escaping closures.
+    if (ApplySite::isa(user)) {
+      AddressCapture capture(*use);
+      if (capture.isValid())
+        Captures.emplace_back(capture);
+      else
+        // Only full apply sites can have non-inout_aliasable address arguments,
+        // but those aren't actually captures.
+        assert(FullApplySite::isa(user));
+    }
   }
 }
 
@@ -463,6 +478,13 @@ void SelectEnforcement::updateCapture(AddressCapture capture) {
     if (hasPotentiallyEscapedAt(user))
       dynamicCaptures.recordCapture(capture);
   };
+  SingleValueInstruction *PAIUser = dyn_cast<PartialApplyInst>(capture.site);
+  if (!PAIUser) {
+    // This is a full apply site. Immediately record the capture and return.
+    captureIfEscaped(capture.site.getInstruction());
+    return;
+  }
+  // For partial applies, check all use points of the closure.
   llvm::SmallSetVector<SingleValueInstruction *, 8> worklist;
   auto visitUse = [&](Operand *oper) {
     auto *user = oper->getUser();
@@ -492,6 +514,8 @@ void SelectEnforcement::updateCapture(AddressCapture capture) {
     case SILInstructionKind::RetainValueInst:
     case SILInstructionKind::ReleaseValueInst:
     case SILInstructionKind::EndBorrowInst:
+    // partial_apply [stack] is matched with dealloc_stack.
+    case SILInstructionKind::DeallocStackInst:
       // Benign use.
       return;
     case SILInstructionKind::TupleExtractInst:
@@ -513,7 +537,6 @@ void SelectEnforcement::updateCapture(AddressCapture capture) {
       captureIfEscaped(user);
     }
   };
-  SingleValueInstruction *PAIUser = dyn_cast<PartialApplyInst>(capture.site);
   while (true) {
     for (auto *oper : PAIUser->getUses())
       visitUse(oper);
@@ -553,11 +576,10 @@ class AccessEnforcementSelection : public SILModuleTransform {
   // they reference.
   DynamicCaptures dynamicCaptures;
 
-  // Per-function book-keeping. A box is processed the first time one of it's
-  // accesses is handled. Don't process it again for subsequent accesses.
-  llvm::DenseSet<AllocBoxInst *> handledBoxes;
-
 #ifndef NDEBUG
+  // Per-function book-keeping to verify that a box is processed before all of
+  // its accesses and captures are seen.
+  llvm::DenseSet<AllocBoxInst *> handledBoxes;
   llvm::DenseSet<SILFunction *> visited;
 #endif
 
@@ -568,7 +590,7 @@ protected:
   void processFunction(SILFunction *F);
   SourceAccess getAccessKindForBox(ProjectBoxInst *projection);
   SourceAccess getSourceAccess(SILValue address);
-  void handlePartialApply(PartialApplyInst *PAI);
+  void handleApply(ApplySite apply);
   void handleAccess(BeginAccessInst *access);
 };
 
@@ -580,6 +602,9 @@ void AccessEnforcementSelection::run() {
 }
 
 void AccessEnforcementSelection::processFunction(SILFunction *F) {
+  if (F->isExternalDeclaration())
+    return;
+
   LLVM_DEBUG(llvm::dbgs() << "Access Enforcement Selection in " << F->getName()
                           << "\n");
 
@@ -599,29 +624,43 @@ void AccessEnforcementSelection::processFunction(SILFunction *F) {
   }
   visited.insert(F);
 #endif
+
   // Deserialized functions, which have been mandatory inlined, no longer meet
   // the structural requirements on access markers required by this pass.
   if (F->wasDeserializedCanonical())
     return;
 
-  for (auto &bb : *F) {
-    for (auto ii = bb.begin(), ie = bb.end(); ii != ie;) {
+  // Perform an RPO walk so that boxes are always processed before their access.
+  auto *PO = getAnalysis<PostOrderAnalysis>()->get(F);
+  for (SILBasicBlock *bb : PO->getReversePostOrder()) {
+    for (auto ii = bb->begin(), ie = bb->end(); ii != ie;) {
       SILInstruction *inst = &*ii;
       ++ii;
 
-      if (auto access = dyn_cast<BeginAccessInst>(inst))
+      // Analyze all boxes. Even if they aren't accessed in this function, they
+      // may still have captures that require dynamic enforcement because the
+      // box has escaped prior to the capture.
+      if (auto box = dyn_cast<AllocBoxInst>(inst)) {
+        SelectEnforcement(dynamicCaptures, box).run();
+        assert(handledBoxes.insert(box).second);
+
+      } else if (auto access = dyn_cast<BeginAccessInst>(inst))
         handleAccess(access);
 
       else if (auto access = dyn_cast<BeginUnpairedAccessInst>(inst))
         assert(access->getEnforcement() == SILAccessEnforcement::Dynamic);
 
-      else if(auto pa = dyn_cast<PartialApplyInst>(inst))
-        handlePartialApply(pa);
+      // Check for unboxed captures in both partial_applies and direct
+      // applications of non-escaping closures.
+      else if (auto apply = ApplySite::isa(inst))
+        handleApply(apply);
     }
   }
   invalidateAnalysis(F, SILAnalysis::InvalidationKind::Instructions);
+#ifndef NDEBUG
   // There's no need to track handled boxes across functions.
   handledBoxes.clear();
+#endif
 }
 
 SourceAccess
@@ -690,19 +729,17 @@ SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
   return SourceAccess::getStaticAccess();
 }
 
-void AccessEnforcementSelection::handlePartialApply(PartialApplyInst *PAI) {
-  ApplySite site(PAI);
-  auto calleeTy = PAI->getOrigCalleeType();
+void AccessEnforcementSelection::handleApply(ApplySite apply) {
+  auto calleeTy = apply.getOrigCalleeType();
   SILFunctionConventions calleeConv(calleeTy, *getModule());
 
-  for (Operand &oper : site.getArgumentOperands()) {
+  for (Operand &oper : apply.getArgumentOperands()) {
     AddressCapture capture(oper);
     if (!capture.isValid())
       continue;
 
-    // This partial apply creates a non-escaping closure. Check if the closure
-    // captures any Boxed variables from this scope. If so, check if the box
-    // escapes before the access just as we do for normal accesses.
+    // This is a non-escaping closure argument. If the argument requires dynamic
+    // access, record that in dynamicCaptures.
     auto sourceAccess = getSourceAccess(oper.get());
     switch (sourceAccess.kind) {
     case SourceAccess::StaticAccess:
@@ -714,8 +751,11 @@ void AccessEnforcementSelection::handlePartialApply(PartialApplyInst *PAI) {
       break;
     }
     case SourceAccess::BoxAccess:
-      if (handledBoxes.insert(sourceAccess.allocBox).second)
-        SelectEnforcement(dynamicCaptures, sourceAccess.allocBox).run();
+      // Captures of box projections are handled during SelectEnforcement, which
+      // determines the access enforcement for all users of a box. Within
+      // SelectEnforcement, we know whether the box has escaped before the
+      // capture. Here there's just nothing to do.
+      assert(handledBoxes.count(sourceAccess.allocBox));
       break;
     }
   }
@@ -734,10 +774,7 @@ void AccessEnforcementSelection::handleAccess(BeginAccessInst *access) {
     setDynamicEnforcement(access);
     break;
   case SourceAccess::BoxAccess:
-    // If this box was handled, the access enforcement would already be set.
-    assert(!handledBoxes.count(sourceAccess.allocBox));
-    SelectEnforcement(dynamicCaptures, sourceAccess.allocBox).run();
-    break;
+    llvm_unreachable("All boxes must have already been selected.");
   }
 }
 

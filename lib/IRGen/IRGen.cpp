@@ -200,6 +200,9 @@ void swift::performLLVMOptimizations(IRGenOptions &Opts, llvm::Module *Module,
                            addSwiftContractPass);
   }
 
+  if (RunSwiftSpecificLLVMOptzns)
+    addCoroutinePassesToExtensionPoints(PMBuilder);
+
   if (Opts.Sanitizers & SanitizerKind::Address) {
     PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
                            addAddressSanitizerPasses);
@@ -222,10 +225,6 @@ void swift::performLLVMOptimizations(IRGenOptions &Opts, llvm::Module *Module,
     PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
                            addSanitizerCoveragePass);
   }
-
-  if (RunSwiftSpecificLLVMOptzns)
-    addCoroutinePassesToExtensionPoints(PMBuilder);
-
   if (RunSwiftSpecificLLVMOptzns)
     PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
                            addSwiftMergeFunctionsPass);
@@ -262,8 +261,13 @@ void swift::performLLVMOptimizations(IRGenOptions &Opts, llvm::Module *Module,
       TargetMachine->getTargetIRAnalysis()));
 
   // If we're generating a profile, add the lowering pass now.
-  if (Opts.GenerateProfile)
-    ModulePasses.add(createInstrProfilingLegacyPass());
+  if (Opts.GenerateProfile) {
+    // TODO: Surface the option to emit atomic profile counter increments at
+    // the driver level.
+    InstrProfOptions Options;
+    Options.Atomic = bool(Opts.Sanitizers & SanitizerKind::Thread);
+    ModulePasses.add(createInstrProfilingLegacyPass(Options));
+  }
 
   PMBuilder.populateModulePassManager(ModulePasses);
 
@@ -337,7 +341,7 @@ static void getHashOfModule(MD5::MD5Result &Result, IRGenOptions &Opts,
                             version::Version const& effectiveLanguageVersion) {
   // Calculate the hash of the whole llvm module.
   MD5Stream HashStream;
-  llvm::WriteBitcodeToFile(Module, HashStream);
+  llvm::WriteBitcodeToFile(*Module, HashStream);
 
   // Update the hash with the compiler version. We want to recompile if the
   // llvm pipeline of the compiler changed.
@@ -518,7 +522,7 @@ bool swift::performLLVM(IRGenOptions &Opts, DiagnosticEngine *Diags,
     EmitPasses.add(createTargetTransformInfoWrapperPass(
         TargetMachine->getTargetIRAnalysis()));
 
-    bool fail = TargetMachine->addPassesToEmitFile(EmitPasses, *RawOS,
+    bool fail = TargetMachine->addPassesToEmitFile(EmitPasses, *RawOS, nullptr,
                                                    FileType, !Opts.Verify);
     if (fail) {
       if (Diags) {
@@ -636,7 +640,7 @@ static void embedBitcode(llvm::Module *M, const IRGenOptions &Opts)
   std::string Data;
   llvm::raw_string_ostream OS(Data);
   if (Opts.EmbedMode == IRGenEmbedMode::EmbedBitcode)
-    llvm::WriteBitcodeToFile(M, OS);
+    llvm::WriteBitcodeToFile(*M, OS);
 
   ArrayRef<uint8_t> ModuleData(
       reinterpret_cast<const uint8_t *>(OS.str().data()), OS.str().size());
@@ -735,7 +739,7 @@ void swift::irgen::deleteIRGenModule(
   delete IRGenPair.first;
 }
 
-/// \brief Run the IRGen preparation SIL pipeline. Passes have access to the
+/// Run the IRGen preparation SIL pipeline. Passes have access to the
 /// IRGenModule.
 static void runIRGenPreparePasses(SILModule &Module,
                                   irgen::IRGenModule &IRModule) {
@@ -757,15 +761,12 @@ static void runIRGenPreparePasses(SILModule &Module,
 
 /// Generates LLVM IR, runs the LLVM passes and produces the output file.
 /// All this is done in a single thread.
-static std::unique_ptr<llvm::Module> performIRGeneration(IRGenOptions &Opts,
-                                                         swift::ModuleDecl *M,
-                                            std::unique_ptr<SILModule> SILMod,
-                                                         StringRef ModuleName,
-                                              const PrimarySpecificPaths &PSPs,
-                                                 llvm::LLVMContext &LLVMContext,
-                                                       SourceFile *SF = nullptr,
-                                 llvm::GlobalVariable **outModuleHash = nullptr,
-                                                       unsigned StartElem = 0) {
+static std::unique_ptr<llvm::Module>
+performIRGeneration(IRGenOptions &Opts, ModuleDecl *M,
+                    std::unique_ptr<SILModule> SILMod, StringRef ModuleName,
+                    const PrimarySpecificPaths &PSPs,
+                    llvm::LLVMContext &LLVMContext, SourceFile *SF = nullptr,
+                    llvm::GlobalVariable **outModuleHash = nullptr) {
   auto &Ctx = M->getASTContext();
   assert(!Ctx.hadError());
 
@@ -790,13 +791,12 @@ static std::unique_ptr<llvm::Module> performIRGeneration(IRGenOptions &Opts,
     irgen.emitGlobalTopLevel();
 
     if (SF) {
-      IGM.emitSourceFile(*SF, StartElem);
+      IGM.emitSourceFile(*SF);
     } else {
-      assert(StartElem == 0 && "no explicit source file provided");
       for (auto *File : M->getFiles()) {
         if (auto *nextSF = dyn_cast<SourceFile>(File)) {
           if (nextSF->ASTStage >= SourceFile::TypeChecked)
-            IGM.emitSourceFile(*nextSF, 0);
+            IGM.emitSourceFile(*nextSF);
         } else {
           File->collectLinkLibraries([&IGM](LinkLibrary LinkLib) {
             IGM.addLinkLibrary(LinkLib);
@@ -821,6 +821,7 @@ static std::unique_ptr<llvm::Module> performIRGeneration(IRGenOptions &Opts,
       IGM.emitBuiltinReflectionMetadata();
       IGM.emitReflectionMetadataVersion();
       irgen.emitEagerClassInitialization();
+      irgen.emitDynamicReplacements();
     }
 
     // Emit symbols for eliminated dead methods.
@@ -869,26 +870,105 @@ static std::unique_ptr<llvm::Module> performIRGeneration(IRGenOptions &Opts,
   return std::unique_ptr<llvm::Module>(IGM.releaseModule());
 }
 
-static void ThreadEntryPoint(IRGenerator *irgen,
-                             llvm::sys::Mutex *DiagMutex, int ThreadIdx) {
-  while (IRGenModule *IGM = irgen->fetchFromQueue()) {
-    LLVM_DEBUG(DiagMutex->lock(); dbgs() << "thread " << ThreadIdx
-                                         << ": fetched "
-                                         << IGM->OutputFilename << "\n";
-               DiagMutex->unlock(););
-    embedBitcode(IGM->getModule(), irgen->Opts);
-    performLLVM(irgen->Opts, &IGM->Context.Diags, DiagMutex, IGM->ModuleHash,
-                IGM->getModule(), IGM->TargetMachine.get(),
-                IGM->Context.LangOpts.EffectiveLanguageVersion,
-                IGM->OutputFilename, IGM->Context.Stats);
-    if (IGM->Context.Diags.hadAnyError())
+namespace {
+struct LLVMCodeGenThreads {
+
+  struct Thread {
+    LLVMCodeGenThreads &parent;
+    unsigned threadIndex;
+#ifdef __APPLE__
+    pthread_t threadId;
+#else
+    std::thread thread;
+#endif
+
+    Thread(LLVMCodeGenThreads &parent, unsigned threadIndex)
+        : parent(parent), threadIndex(threadIndex)
+    {}
+
+    /// Run llvm codegen.
+    void run() {
+      auto *diagMutex = parent.diagMutex;
+      while (IRGenModule *IGM = parent.irgen->fetchFromQueue()) {
+        LLVM_DEBUG(diagMutex->lock();
+                   dbgs() << "thread " << threadIndex << ": fetched "
+                          << IGM->OutputFilename << "\n";
+                   diagMutex->unlock(););
+        embedBitcode(IGM->getModule(), parent.irgen->Opts);
+        performLLVM(parent.irgen->Opts, &IGM->Context.Diags, diagMutex,
+                    IGM->ModuleHash, IGM->getModule(), IGM->TargetMachine.get(),
+                    IGM->Context.LangOpts.EffectiveLanguageVersion,
+                    IGM->OutputFilename, IGM->Context.Stats);
+        if (IGM->Context.Diags.hadAnyError())
+          return;
+      }
+      LLVM_DEBUG(diagMutex->lock();
+                 dbgs() << "thread " << threadIndex << ": done\n";
+                 diagMutex->unlock(););
       return;
+    }
+  };
+
+  IRGenerator *irgen;
+  llvm::sys::Mutex *diagMutex;
+  std::vector<Thread> threads;
+
+  LLVMCodeGenThreads(IRGenerator *irgen, llvm::sys::Mutex *diagMutex,
+                     unsigned numThreads)
+      : irgen(irgen), diagMutex(diagMutex) {
+    threads.reserve(numThreads);
+    for (unsigned idx = 0; idx < numThreads; ++idx) {
+      // the 0-th thread is executed by the main thread.
+      threads.push_back(Thread(*this, idx + 1));
+    }
   }
-  LLVM_DEBUG(
-    DiagMutex->lock();
-    dbgs() << "thread " << ThreadIdx << ": done\n";
-    DiagMutex->unlock();
-  );
+
+  static void *runThread(void *arg) {
+    auto *thread = reinterpret_cast<Thread *>(arg);
+    thread->run();
+    return nullptr;
+  }
+
+  void startThreads() {
+#ifdef __APPLE__
+    // Increase the thread stack size on macosx to 8MB (default is 512KB). This
+    // matches the main thread.
+    pthread_attr_t stackSizeAttribute;
+    int err = pthread_attr_init(&stackSizeAttribute);
+    assert(!err);
+    err = pthread_attr_setstacksize(&stackSizeAttribute, 8 * 1024 * 1024);
+    assert(!err);
+
+    for (auto &thread : threads) {
+      pthread_create(&thread.threadId, &stackSizeAttribute,
+                     LLVMCodeGenThreads::runThread, &thread);
+    }
+
+    pthread_attr_destroy(&stackSizeAttribute);
+#else
+    for (auto &thread : threads) {
+      thread.thread = std::thread(runThread, &thread);
+    }
+#endif
+
+  }
+
+  void runMainThread() {
+    Thread mainThread(*this, 0);
+    mainThread.run();
+  }
+
+  void join() {
+#ifdef __APPLE__
+    for (auto &thread : threads)
+      pthread_join(thread.threadId, 0);
+#else
+    for (auto &thread: threads) {
+      thread.thread.join();
+    }
+#endif
+  }
+};
 }
 
 /// Generates LLVM IR, runs the LLVM passes and produces the output files.
@@ -962,12 +1042,12 @@ static void performParallelIRGeneration(
   }
 
   // Emit the module contents.
-  irgen.emitGlobalTopLevel(true /*emitForParallelEmission*/);
+  irgen.emitGlobalTopLevel();
 
   for (auto *File : M->getFiles()) {
     if (auto *SF = dyn_cast<SourceFile>(File)) {
-      IRGenModule *IGM = irgen.getGenModule(SF);
-      IGM->emitSourceFile(*SF, 0);
+      CurrentIGMPtr IGM = irgen.getGenModule(SF);
+      IGM->emitSourceFile(*SF);
     } else {
       File->collectLinkLibraries([&](LinkLibrary LinkLib) {
         irgen.getPrimaryIGM()->addLinkLibrary(LinkLib);
@@ -979,6 +1059,8 @@ static void performParallelIRGeneration(
   irgen.emitLazyDefinitions();
 
   irgen.emitSwiftProtocols();
+
+  irgen.emitDynamicReplacements();
 
   irgen.emitProtocolConformances();
 
@@ -1005,7 +1087,7 @@ static void performParallelIRGeneration(
                   PrimaryGM->addLinkLibrary(linkLib);
                 });
   
-  llvm::StringSet<> referencedGlobals;
+  llvm::DenseSet<StringRef> referencedGlobals;
 
   for (auto it = irgen.begin(); it != irgen.end(); ++it) {
     IRGenModule *IGM = it->second;
@@ -1065,26 +1147,22 @@ static void performParallelIRGeneration(
 
   SharedTimer timer("LLVM pipeline");
 
-  std::vector<std::thread> Threads;
   llvm::sys::Mutex DiagMutex;
 
   // Start all the threads and do the LLVM compilation.
-  for (int ThreadIdx = 1; ThreadIdx < numThreads; ++ThreadIdx) {
-    Threads.push_back(std::thread(ThreadEntryPoint, &irgen, &DiagMutex,
-                                  ThreadIdx));
-  }
+  LLVMCodeGenThreads codeGenThreads(&irgen, &DiagMutex, numThreads - 1);
+  codeGenThreads.startThreads();
 
   // Free the memory occupied by the SILModule.
   // Execute this task in parallel to the LLVM compilation.
   auto SILModuleRelease = [&SILMod]() { SILMod.reset(nullptr); };
-  Threads.push_back(std::thread(SILModuleRelease));
+  auto releaseModuleThread = std::thread(SILModuleRelease);
 
-  ThreadEntryPoint(&irgen, &DiagMutex, 0);
+  codeGenThreads.runMainThread();
 
   // Wait for all threads.
-  for (std::thread &Thread : Threads) {
-    Thread.join();
-  }
+  releaseModuleThread.join();
+  codeGenThreads.join();
 }
 
 std::unique_ptr<llvm::Module> swift::performIRGeneration(
@@ -1111,12 +1189,10 @@ performIRGeneration(IRGenOptions &Opts, SourceFile &SF,
                     std::unique_ptr<SILModule> SILMod,
                     StringRef ModuleName, const PrimarySpecificPaths &PSPs,
                     llvm::LLVMContext &LLVMContext,
-                    unsigned StartElem,
                     llvm::GlobalVariable **outModuleHash) {
-  return ::performIRGeneration(Opts, SF.getParentModule(),
-                               std::move(SILMod), ModuleName,
-                               PSPs,
-                               LLVMContext, &SF, outModuleHash, StartElem);
+  return ::performIRGeneration(Opts, SF.getParentModule(), std::move(SILMod),
+                               ModuleName, PSPs, LLVMContext, &SF,
+                               outModuleHash);
 }
 
 void
@@ -1158,7 +1234,7 @@ swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
     Section = std::string(MachOASTSegmentName) + "," + MachOASTSectionName;
     break;
   case llvm::Triple::Wasm:
-    llvm_unreachable("web assembly object format is not supported.");
+    Section = WasmASTSectionName;
     break;
   }
   ASTSym->setSection(Section);

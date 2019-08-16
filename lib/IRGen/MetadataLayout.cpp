@@ -31,6 +31,7 @@
 #include "IRGenFunction.h"
 #include "StructMetadataVisitor.h"
 #include "ForeignClassMetadataVisitor.h"
+#include "TupleMetadataVisitor.h"
 
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/Optional.h"
@@ -280,7 +281,7 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
         Layout.StartOfImmediateMembers = getNextOffset();
 
         if (Layout.HasResilientSuperclass ||
-            IGM.isResilient(forClass, ResilienceExpansion::Maximal)) {
+            IGM.hasResilientMetadata(forClass, ResilienceExpansion::Maximal)) {
           assert(!DynamicOffsetBase);
           DynamicOffsetBase = NextOffset;
         }
@@ -313,19 +314,18 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
       super::noteStartOfGenericRequirements(forClass);
     }
 
-    void addGenericWitnessTable(CanType argType, ProtocolConformanceRef conf,
-                                ClassDecl *forClass) {
+    void addGenericWitnessTable(ClassDecl *forClass) {
       if (forClass == Target) {
         Layout.NumImmediateMembers++;
       }
-      super::addGenericWitnessTable(argType, conf, forClass);
+      super::addGenericWitnessTable(forClass);
     }
 
-    void addGenericArgument(CanType argType, ClassDecl *forClass) {
+    void addGenericArgument(ClassDecl *forClass) {
       if (forClass == Target) {
         Layout.NumImmediateMembers++;
       }
-      super::addGenericArgument(argType, forClass);
+      super::addGenericArgument(forClass);
     }
 
     void addMethod(SILDeclRef fn) {
@@ -398,16 +398,6 @@ ClassMetadataLayout::getMethodInfo(IRGenFunction &IGF, SILDeclRef method) const{
   auto &stored = getStoredMethodInfo(method);
   auto offset = emitOffset(IGF, stored.TheOffset);
   return MethodInfo(offset);
-}
-
-MetadataLayout::StoredOffset
-ClassMetadataLayout::getMethodOffsetInfo(SILDeclRef method) const {
-  return getStoredMethodInfo(method).TheOffset;
-}
-
-Offset
-ClassMetadataLayout::getVTableOffset(IRGenFunction &IGF) const {
-  return emitOffset(IGF, VTableOffset);
 }
 
 Offset ClassMetadataLayout::getFieldOffset(IRGenFunction &IGF,
@@ -489,6 +479,39 @@ Address irgen::emitAddressOfSuperclassRefInClassMetadata(IRGenFunction &IGF,
   Address addr(metadata, IGF.IGM.getPointerAlignment());
   addr = IGF.Builder.CreateElementBitCast(addr, IGF.IGM.TypeMetadataPtrTy);
   return IGF.Builder.CreateConstArrayGEP(addr, index, IGF.IGM.getPointerSize());
+}
+
+Size irgen::getStaticTupleElementOffset(IRGenModule &IGM,
+                                        SILType tupleType,
+                                        unsigned eltIdx) {
+  assert(tupleType.is<TupleType>() && "not a tuple type");
+
+  struct TupleElementOffsetScanner
+       : LayoutScanner<TupleElementOffsetScanner, TupleMetadataScanner> {
+  private:
+    using super = LayoutScanner;
+
+    // 8 seems a reasonable potential max number tuple elements to start with
+    llvm::SmallVector<Size, 8> Offsets;
+
+  public:
+    TupleElementOffsetScanner(IRGenModule &IGM, TupleType *const tupleType)
+      : super(IGM, tupleType) {}
+
+    void addElement(unsigned eltIdx, const TupleTypeElt &elt) {
+      Offsets.push_back(NextOffset);
+      super::addElement(eltIdx, elt);
+    }
+
+    Size getElementOffset(unsigned eltIdx) const {
+      return Offsets[eltIdx];
+    }
+  };
+
+  TupleElementOffsetScanner s(IGM, tupleType.getAs<TupleType>().getPointer());
+  s.layout();
+
+  return s.getElementOffset(eltIdx);
 }
 
 /*********************************** ENUMS ************************************/

@@ -61,10 +61,10 @@
 /// `replaceSubrange(_:with:)` with an empty collection for the `newElements`
 /// parameter. You can override any of the protocol's required methods to
 /// provide your own custom implementation.
-public protocol RangeReplaceableCollection : Collection
-  where SubSequence : RangeReplaceableCollection {
-  // FIXME(ABI): Associated type inference requires this.
-  associatedtype SubSequence
+public protocol RangeReplaceableCollection: Collection
+  where SubSequence: RangeReplaceableCollection {
+  // FIXME: Associated type inference requires this.
+  override associatedtype SubSequence
 
   //===--- Fundamental Requirements ---------------------------------------===//
 
@@ -109,8 +109,8 @@ public protocol RangeReplaceableCollection : Collection
   ///   equivalent to `append(contentsOf:)`.
   mutating func replaceSubrange<C>(
     _ subrange: Range<Index>,
-    with newElements: C
-  ) where C : Collection, C.Element == Element
+    with newElements: __owned C
+  ) where C: Collection, C.Element == Element
 
   /// Prepares the collection to store the specified number of elements, when
   /// doing so is appropriate for the underlying type.
@@ -147,7 +147,7 @@ public protocol RangeReplaceableCollection : Collection
   ///
   /// - Parameter elements: The sequence of elements for the new collection.
   ///   `elements` must be finite.
-  init<S : Sequence>(_ elements: S)
+  init<S: Sequence>(_ elements: S)
     where S.Element == Element
 
   /// Adds an element to the end of the collection.
@@ -185,7 +185,7 @@ public protocol RangeReplaceableCollection : Collection
   /// - Parameter newElements: The elements to append to the collection.
   ///
   /// - Complexity: O(*m*), where *m* is the length of `newElements`.
-  mutating func append<S : Sequence>(contentsOf newElements: __owned S)
+  mutating func append<S: Sequence>(contentsOf newElements: __owned S)
     where S.Element == Element
   // FIXME(ABI)#166 (Evolution): Consider replacing .append(contentsOf) with +=
   // suggestion in SE-91
@@ -240,7 +240,7 @@ public protocol RangeReplaceableCollection : Collection
   /// - Complexity: O(*n* + *m*), where *n* is length of this collection and
   ///   *m* is the length of `newElements`. If `i == endIndex`, this method
   ///   is equivalent to `append(contentsOf:)`.
-  mutating func insert<S : Collection>(contentsOf newElements: __owned S, at i: Index)
+  mutating func insert<S: Collection>(contentsOf newElements: __owned S, at i: Index)
     where S.Element == Element
 
   /// Removes and returns the element at the specified position.
@@ -343,7 +343,16 @@ public protocol RangeReplaceableCollection : Collection
   /// - Complexity: O(*n*), where *n* is the length of the collection.
   mutating func removeAll(keepingCapacity keepCapacity: Bool /*= false*/)
 
-  /// Removes from the collection all elements that satisfy the given predicate.
+  /// Removes all the elements that satisfy the given predicate.
+  ///
+  /// Use this method to remove every element in a collection that meets
+  /// particular criteria. The order of the remaining elements is preserved.
+  /// This example removes all the odd values from an
+  /// array of numbers:
+  ///
+  ///     var numbers = [5, 6, 7, 8, 9, 10, 11]
+  ///     numbers.removeAll(where: { $0 % 2 != 0 })
+  ///     // numbers == [6, 8, 10]
   ///
   /// - Parameter shouldBeRemoved: A closure that takes an element of the
   ///   sequence as its argument and returns a Boolean value indicating
@@ -353,11 +362,10 @@ public protocol RangeReplaceableCollection : Collection
   mutating func removeAll(
     where shouldBeRemoved: (Element) throws -> Bool) rethrows
 
-  // FIXME(ABI): Associated type inference requires this.
-  subscript(bounds: Index) -> Element { get }
-
-  // FIXME(ABI): Associated type inference requires this.
-  subscript(bounds: Range<Index>) -> SubSequence { get }
+  // FIXME: Associated type inference requires these.
+  @_borrowed
+  override subscript(bounds: Index) -> Element { get }
+  override subscript(bounds: Range<Index>) -> SubSequence { get }
 }
 
 //===----------------------------------------------------------------------===//
@@ -393,7 +401,7 @@ extension RangeReplaceableCollection {
   ///
   /// - Parameter elements: The sequence of elements for the new collection.
   @inlinable
-  public init<S : Sequence>(_ elements: S)
+  public init<S: Sequence>(_ elements: S)
     where S.Element == Element {
     self.init()
     append(contentsOf: elements)
@@ -416,7 +424,7 @@ extension RangeReplaceableCollection {
   /// - Complexity: O(1) on average, over many calls to `append(_:)` on the
   ///   same collection.
   @inlinable
-  public mutating func append(_ newElement: Element) {
+  public mutating func append(_ newElement: __owned Element) {
     insert(newElement, at: endIndex)
   }
 
@@ -438,7 +446,7 @@ extension RangeReplaceableCollection {
   ///
   /// - Complexity: O(*m*), where *m* is the length of `newElements`.
   @inlinable
-  public mutating func append<S : Sequence>(contentsOf newElements: S)
+  public mutating func append<S: Sequence>(contentsOf newElements: __owned S)
     where S.Element == Element {
 
     let approximateCapacity = self.count +
@@ -474,7 +482,7 @@ extension RangeReplaceableCollection {
   ///   `i == endIndex`, this method is equivalent to `append(_:)`.
   @inlinable
   public mutating func insert(
-    _ newElement: Element, at i: Index
+    _ newElement: __owned Element, at i: Index
   ) {
     replaceSubrange(i..<i, with: CollectionOfOne(newElement))
   }
@@ -505,8 +513,8 @@ extension RangeReplaceableCollection {
   ///   *m* is the length of `newElements`. If `i == endIndex`, this method
   ///   is equivalent to `append(contentsOf:)`.
   @inlinable
-  public mutating func insert<C : Collection>(
-    contentsOf newElements: C, at i: Index
+  public mutating func insert<C: Collection>(
+    contentsOf newElements: __owned C, at i: Index
   ) where C.Element == Element {
     replaceSubrange(i..<i, with: newElements)
   }
@@ -737,7 +745,7 @@ extension RangeReplaceableCollection {
   @inlinable
   public mutating func replaceSubrange<C: Collection, R: RangeExpression>(
     _ subrange: R,
-    with newElements: C
+    with newElements: __owned C
   ) where C.Element == Element, R.Bound == Index {
     self.replaceSubrange(subrange.relative(to: self), with: newElements)
   }
@@ -781,7 +789,7 @@ extension RangeReplaceableCollection {
 }
 
 extension RangeReplaceableCollection
-  where Self : BidirectionalCollection, SubSequence == Self {
+  where Self: BidirectionalCollection, SubSequence == Self {
 
   @inlinable
   public mutating func _customRemoveLast() -> Element? {
@@ -797,7 +805,7 @@ extension RangeReplaceableCollection
   }
 }
 
-extension RangeReplaceableCollection where Self : BidirectionalCollection {
+extension RangeReplaceableCollection where Self: BidirectionalCollection {
   /// Removes and returns the last element of the collection.
   ///
   /// Calling this method may invalidate all saved indices of this
@@ -868,7 +876,7 @@ extension RangeReplaceableCollection where Self : BidirectionalCollection {
 
 /// Ambiguity breakers.
 extension RangeReplaceableCollection
-where Self : BidirectionalCollection, SubSequence == Self {
+where Self: BidirectionalCollection, SubSequence == Self {
   /// Removes and returns the last element of the collection.
   ///
   /// Calling this method may invalidate all saved indices of this
@@ -957,7 +965,7 @@ extension RangeReplaceableCollection {
   ///   - rhs: A collection or finite sequence.
   @inlinable
   public static func + <
-    Other : Sequence
+    Other: Sequence
   >(lhs: Self, rhs: Other) -> Self
   where Element == Other.Element {
     var lhs = lhs
@@ -986,7 +994,7 @@ extension RangeReplaceableCollection {
   ///   - rhs: A range-replaceable collection.
   @inlinable
   public static func + <
-    Other : Sequence
+    Other: Sequence
   >(lhs: Other, rhs: Self) -> Self
   where Element == Other.Element {
     var result = Self()
@@ -1015,7 +1023,7 @@ extension RangeReplaceableCollection {
   ///   argument.
   @inlinable
   public static func += <
-    Other : Sequence
+    Other: Sequence
   >(lhs: inout Self, rhs: Other)
   where Element == Other.Element {
     lhs.append(contentsOf: rhs)
@@ -1041,7 +1049,7 @@ extension RangeReplaceableCollection {
   ///   - rhs: Another range-replaceable collection.
   @inlinable
   public static func + <
-    Other : RangeReplaceableCollection
+    Other: RangeReplaceableCollection
   >(lhs: Self, rhs: Other) -> Self
   where Element == Other.Element {
     var lhs = lhs
@@ -1072,7 +1080,7 @@ extension RangeReplaceableCollection {
   /// - Complexity: O(*n*), where *n* is the length of the collection.
   @inlinable
   @available(swift, introduced: 4.0)
-  public func filter(
+  public __consuming func filter(
     _ isIncluded: (Element) throws -> Bool
   ) rethrows -> Self {
     return try Self(self.lazy.filter(isIncluded))
@@ -1083,11 +1091,12 @@ extension RangeReplaceableCollection where Self: MutableCollection {
   /// Removes all the elements that satisfy the given predicate.
   ///
   /// Use this method to remove every element in a collection that meets
-  /// particular criteria. This example removes all the odd values from an
+  /// particular criteria. The order of the remaining elements is preserved.
+  /// This example removes all the odd values from an
   /// array of numbers:
   ///
   ///     var numbers = [5, 6, 7, 8, 9, 10, 11]
-  ///     numbers.removeAll(where: { $0 % 2 == 1 })
+  ///     numbers.removeAll(where: { $0 % 2 != 0 })
   ///     // numbers == [6, 8, 10]
   ///
   /// - Parameter shouldBeRemoved: A closure that takes an element of the
@@ -1108,7 +1117,8 @@ extension RangeReplaceableCollection {
   /// Removes all the elements that satisfy the given predicate.
   ///
   /// Use this method to remove every element in a collection that meets
-  /// particular criteria. This example removes all the vowels from a string:
+  /// particular criteria. The order of the remaining elements is preserved.
+  /// This example removes all the vowels from a string:
   ///
   ///     var phrase = "The rain in Spain stays mainly in the plain."
   ///

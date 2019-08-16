@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil %s -emit-silgen | %FileCheck %s
+// RUN: %target-swift-frontend %s -emit-silgen | %FileCheck %s
 
 // Check that all reference counting instructions can take the [nonatomic]
 // attribute. SIL parser should be able to parse this attribute and
@@ -43,20 +43,6 @@ bb0:
   retain_value [nonatomic] %1 : $C
   release_value [nonatomic] %1 : $C
   return %1 : $C
-}
-
-// CHECK-LABEL: sil @test_nonatomic_pin_unpin
-// CHECK: strong_pin [nonatomic]
-// CHECK: strong_unpin [nonatomic]
-// CHECK: return
-sil @test_nonatomic_pin_unpin: $@convention(thin) () -> () {
-bb0:
-  %0 = alloc_ref $C
-  %1 = unchecked_ref_cast %0 : $C to  $Builtin.NativeObject
-  %2 = strong_pin [nonatomic] %1 : $Builtin.NativeObject
-  strong_unpin [nonatomic] %2 : $Optional<Builtin.NativeObject>
-  %3 = tuple ()
-  return %3 : $()
 }
 
 // CHECK-LABEL: sil @test_unowned_nonatomic_rr

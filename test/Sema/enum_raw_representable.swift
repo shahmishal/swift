@@ -64,7 +64,7 @@ var colorRaw: Color.RawValue = 7.5
 
 // Mismatched case types
 
-enum BadPlain : UInt { // expected-error {{'BadPlain' declares raw type 'UInt', but does not conform to RawRepresentable and conformance could not be synthesized}}
+enum BadPlain : UInt { // expected-error {{'BadPlain' declares raw type 'UInt', but does not conform to RawRepresentable and conformance could not be synthesized}} expected-note {{do you want to add protocol stubs?}}
     case a = "hello"   // expected-error {{cannot convert value of type 'String' to raw type 'UInt'}}
 }
 
@@ -77,7 +77,7 @@ class Outer {
   // scenario too.
   let a: Int = E.a // expected-error {{cannot convert value of type 'Outer.E' to specified type 'Int'}}
 
-  enum E : Array<Int> { // expected-error {{raw type 'Array<Int>' is not expressible by any literal}}
+  enum E : Array<Int> { // expected-error {{raw type 'Array<Int>' is not expressible by a string, integer, or floating-point literal}}
     case a
   }
 }
@@ -185,6 +185,7 @@ func sr8150_mutable(obj: SR8150Box) {
 struct NotEquatable { }
 
 enum ArrayOfNewEquatable : Array<NotEquatable> { }
-// expected-error@-1{{raw type 'Array<NotEquatable>' is not expressible by any literal}}
+// expected-error@-1{{raw type 'Array<NotEquatable>' is not expressible by a string, integer, or floating-point literal}}
 // expected-error@-2{{'ArrayOfNewEquatable' declares raw type 'Array<NotEquatable>', but does not conform to RawRepresentable and conformance could not be synthesized}}
 // expected-error@-3{{RawRepresentable conformance cannot be synthesized because raw type 'Array<NotEquatable>' is not Equatable}}
+// expected-note@-4{{do you want to add protocol stubs?}}

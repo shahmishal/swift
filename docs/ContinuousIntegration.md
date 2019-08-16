@@ -10,11 +10,14 @@
     - [Validation Testing](#validation-testing)
     - [Linting](#linting)
     - [Source Compatibility Testing](#source-compatibility-testing)
+    - [Sourcekit Stress Testing](#sourcekit-stress-testing)
     - [Specific Preset Testing](#specific-preset-testing)
     - [Build Swift Toolchain](#build-swift-toolchain)
     - [Testing Compiler Performance](#testing-compiler-performance)
+    - [Swift Community Hosted CI Pull Request Testing](#swift-community-hosted-ci-pull-request-testing)
 - [Cross Repository Testing](#cross-repository-testing)
 - [ci.swift.org bots](#ciswiftorg-bots)
+
 
 ## Introduction
 
@@ -135,20 +138,29 @@ Python       | @swift-ci Please Python lint | Lints Python sources | `./utils/py
 
 Platform       | Comment | Check Status
 ------------   | ------- | ------------
-macOS platform | @swift-ci Please Test Source Compatibility | Swift Source Compatibility Suite on macOS Platform
+macOS platform | @swift-ci Please Test Source Compatibility | Swift Source Compatibility Suite on macOS Platform (Release and Debug)
+macOS platform | @swift-ci Please Test Source Compatibility Release | Swift Source Compatibility Suite on macOS Platform (Release)
+macOS platform | @swift-ci Please Test Source Compatibility Debug | Swift Source Compatibility Suite on macOS Platform (Debug)
+
+### Sourcekit Stress Testing
+
+Platform       | Comment | Check Status
+------------   | ------- | ------------
+macOS platform | @swift-ci Please Sourcekit Stress test | Swift Sourcekit Stress Tester on macOS Platform
 
 ### Specific Preset Testing
 
 Platform       | Comment | Check Status
 ------------   | ------- | ------------
-macOS platform | preset=<preset> <br> @swift-ci Please test macOS with preset | Swift Test macOS Platform with preset
+macOS platform | preset=<preset> <br> @swift-ci Please test with preset macOS Platform | Swift Test macOS Platform with preset
+Linux platform | preset=<preset> <br> @swift-ci Please test with preset Linux Platform | Swift Test Linux Platform with preset
 
 
 For example:
 
 ```
 preset=buildbot_incremental,tools=RA,stdlib=RD,smoketest=macosx,single-thread
-@swift-ci Please test macOS with preset
+@swift-ci Please test with preset macOS
 
 ```
 ### Build Swift Toolchain
@@ -209,6 +221,16 @@ apple/swift-lldb#48
 
 4. Watch the public incremental build on [ci.swift.org](https://ci.swift.org/) to make sure that you did not make any mistakes. It should complete within 30-40 minutes depending on what else was being committed in the mean time.
 
+### Swift Community Hosted CI Pull Request Testing
+
+Currently, supported pull request testing triggers:
+
+Platform     | Comment | Check Status
+------------ | ------- | ------------
+Windows      | @swift-ci Please test Windows platform | Swift Test Windows Platform
+Linux        | @swift-ci Please test Tensorflow Linux platform | Swift Test Linux Platform (TensorFlow)
+Linux (GPU)  | @swift-ci Please test Tensorflow Linux GPU platform |Swift Test Linux Platform with GPU (TensorFlow)
+macOS        | @swift-ci Please test Tensorflow macOS platform | Swift Test macOS Platform (TensorFlow)
 
 ## ci.swift.org bots
 
@@ -221,3 +243,6 @@ FIXME: FILL ME IN!
 3. @swift-ci pull request testing becomes less effective since one can not perform a test and merge and one must reason about the source of a given failure.
 
 <a name="footnote-2">[2]</a> This is due to unrelated issues relating to running lldb tests on macOS.
+
+
+

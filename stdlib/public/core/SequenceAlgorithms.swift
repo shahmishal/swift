@@ -43,7 +43,7 @@ extension Sequence {
   /// list consisting of indices of names with five or fewer letters.
   ///
   ///     let names: Set = ["Sofia", "Camilla", "Martina", "Mateo", "Nicolás"]
-  ///     var shorterIndices: [SetIndex<String>] = []
+  ///     var shorterIndices: [Set<String>.Index] = []
   ///     for (i, name) in zip(names.indices, names) {
   ///         if name.count <= 5 {
   ///             shorterIndices.append(i)
@@ -335,7 +335,7 @@ extension Sequence {
   }
 }
 
-extension Sequence where Element : Equatable {
+extension Sequence where Element: Equatable {
   /// Returns a Boolean value indicating whether this sequence and another
   /// sequence contain the same elements in the same order.
   ///
@@ -430,7 +430,7 @@ extension Sequence {
   }
 }
 
-extension Sequence where Element : Comparable {
+extension Sequence where Element: Comparable {
   /// Returns a Boolean value indicating whether the sequence precedes another
   /// sequence in a lexicographical (dictionary) ordering, using the
   /// less-than operator (`<`) to compare elements.
@@ -544,7 +544,7 @@ extension Sequence {
   }
 }
 
-extension Sequence where Element : Equatable {
+extension Sequence where Element: Equatable {
   /// Returns a Boolean value indicating whether the sequence contains the
   /// given element.
   ///
@@ -679,7 +679,7 @@ extension Sequence {
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
   @inlinable
   public func reduce<Result>(
-    into initialResult: Result,
+    into initialResult: __owned Result,
     _ updateAccumulatingResult:
       (_ partialResult: inout Result, Element) throws -> ()
   ) rethrows -> Result {
@@ -706,7 +706,7 @@ extension Sequence {
   ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
   @inlinable
-  public func reversed() -> [Element] {
+  public __consuming func reversed() -> [Element] {
     // FIXME(performance): optimize to 1 pass?  But Array(self) can be
     // optimized to a memcpy() sometimes.  Those cases are usually collections,
     // though.
@@ -751,7 +751,7 @@ extension Sequence {
   /// - Complexity: O(*m* + *n*), where *n* is the length of this sequence
   ///   and *m* is the length of the result.
   @inlinable
-  public func flatMap<SegmentOfResult : Sequence>(
+  public func flatMap<SegmentOfResult: Sequence>(
     _ transform: (Element) throws -> SegmentOfResult
   ) rethrows -> [SegmentOfResult.Element] {
     var result: [SegmentOfResult.Element] = []
@@ -766,7 +766,7 @@ extension Sequence {
   /// Returns an array containing the non-`nil` results of calling the given
   /// transformation with each element of this sequence.
   ///
-  /// Use this method to receive an array of nonoptional values when your
+  /// Use this method to receive an array of non-optional values when your
   /// transformation produces an optional value.
   ///
   /// In this example, note the difference in the result of using `map` and

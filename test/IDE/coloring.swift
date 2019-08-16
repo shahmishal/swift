@@ -1,15 +1,10 @@
-// We need to require macOS because swiftSyntax currently doesn't build on Linux
-// REQUIRES: OS=macosx
 // RUN: %target-swift-ide-test -syntax-coloring -source-filename %s | %FileCheck %s
-// RUN: %target-swift-ide-test -syntax-coloring -typecheck -source-filename %s | %FileCheck %s -check-prefixes CHECK,CHECK-OLD
-// RUN: %swift-swiftsyntax-test -classify-syntax -source-file %s | %FileCheck %s --check-prefixes CHECK,CHECK-NEW
-// XFAIL: broken_std_regex
+// RUN: %target-swift-ide-test -syntax-coloring -typecheck -source-filename %s | %FileCheck %s
 
 enum List<T> {
   case Nil
   // rdar://21927124
-  // CHECK-OLD: <attr-builtin>indirect</attr-builtin> <kw>case</kw> Cons(T, List)
-  // CHECK-NEW: <attr-builtin>indirect</attr-builtin> <kw>case</kw> Cons(<type>T</type>, <type>List</type>)
+  // CHECK: <attr-builtin>indirect</attr-builtin> <kw>case</kw> Cons(<type>T</type>, <type>List</type>)
   indirect case Cons(T, List)
 }
 
@@ -21,6 +16,15 @@ struct S {
   var y : Int.Int
   // CHECK: <kw>var</kw> a, b : <type>Int</type>
   var a, b : Int
+}
+
+enum EnumWhereCaseHasADefaultedFunctionTypeParam {
+// CHECK: <kw>enum</kw> EnumWhereCaseHasADefaultedFunctionTypeParam {
+  case foo(x: () -> () = {
+  // CHECK: <kw>case</kw> foo(x: () -> () = {
+    func inner(x: S) {}
+    // CHECK: <kw>func</kw> inner(x: <type>S</type>) {}
+  })
 }
 
 enum EnumWithDerivedEquatableConformance : Int {
@@ -85,8 +89,7 @@ class Attributes {
 // CHECK: <attr-builtin>@IBOutlet</attr-builtin> <kw>var</kw> v0: <type>Int</type>
   @IBOutlet var v0: Int
 
-// CHECK-OLD: <attr-builtin>@IBOutlet</attr-builtin> <attr-id>@IBOutlet</attr-id> <kw>var</kw> v1: <type>String</type>
-// CHECK-NEW: <attr-builtin>@IBOutlet</attr-builtin> <attr-builtin>@IBOutlet</attr-builtin> <kw>var</kw> v1: <type>String</type>
+// CHECK: <attr-builtin>@IBOutlet</attr-builtin> <attr-id>@IBOutlet</attr-id> <kw>var</kw> v1: <type>String</type>
   @IBOutlet @IBOutlet var v1: String
 
 // CHECK: <attr-builtin>@objc</attr-builtin> <attr-builtin>@IBOutlet</attr-builtin> <kw>var</kw> v2: <type>String</type>
@@ -171,7 +174,7 @@ protocol Prot {
 infix operator *-* : FunnyPrecedence
 
 // CHECK: <kw>precedencegroup</kw> FunnyPrecedence
-// CHECK-NEXT: <kw>associativity</kw>: left{{$}}
+// CHECK-NEXT: <kw>associativity</kw>: <kw>left</kw>{{$}}
 // CHECK-NEXT: <kw>higherThan</kw>: MultiplicationPrecedence
 precedencegroup FunnyPrecedence {
   associativity: left
@@ -203,6 +206,25 @@ class SubCls : MyCls, Prot {}
 func genFn<T : Prot where T.Blarg : Prot2>(_: T) -> Int {}
 
 func f(x: Int) -> Int {
+
+  // CHECK: <str>#"This is a raw string"#</str>
+  #"This is a raw string"#
+
+  // CHECK: <str>##"This is also a raw string"##</str>
+  ##"This is also a raw string"##
+
+  // CHECK: <str>###"This is an unterminated raw string"</str>
+  ###"This is an unterminated raw string"
+
+  // CHECK: <str>#"""This is a multiline raw string"""#</str>
+  #"""This is a multiline raw string"""#
+
+  // CHECK: <str>#"This is an </str>\#<anchor>(</anchor>interpolated<anchor>)</anchor><str> raw string"#</str>
+  #"This is an \#(interpolated) raw string"#
+
+  // CHECK: <str>#"This is a raw string with an invalid \##() interpolation"#</str>
+  #"This is a raw string with an invalid \##() interpolation"#
+
   // CHECK: <str>"This is string </str>\<anchor>(</anchor>genFn({(a:<type>Int</type> -> <type>Int</type>) <kw>in</kw> a})<anchor>)</anchor><str> interpolation"</str>
   "This is string \(genFn({(a:Int -> Int) in a})) interpolation"
 
@@ -239,8 +261,7 @@ func f(x: Int) -> Int {
    )
    """
 
-  // CHECK-OLD: <str>"</str>\<anchor>(</anchor><int>1</int><anchor>)</anchor>\<anchor>(</anchor><int>1</int><anchor>)</anchor><str>"</str>
-  // CHECK-NEW: <str>"</str>\<anchor>(</anchor><int>1</int><anchor>)</anchor><str></str>\<anchor>(</anchor><int>1</int><anchor>)</anchor><str>"</str>
+  // CHECK: <str>"</str>\<anchor>(</anchor><int>1</int><anchor>)</anchor>\<anchor>(</anchor><int>1</int><anchor>)</anchor><str>"</str>
   "\(1)\(1)"
 }
 
@@ -249,6 +270,9 @@ func bar(x: Int) -> (Int, Float) {
   // CHECK: foo({{(<type>)?}}Float{{(</type>)?}}())
   foo(Float())
 }
+
+// CHECK: <object-literal>#colorLiteral(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)</object-literal>
+#colorLiteral(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
 
 class GenC<T1,T2> {}
 
@@ -264,6 +288,9 @@ func test2(x: Int) {
   // CHECK: <str>"</str>\<anchor>(</anchor>x<anchor>)</anchor><str>"</str>
   "\(x)"
 }
+
+// CHECK: <kw>#colorLiteral</kw>
+#colorLiteral
 
 // CHECK: <kw>class</kw> Observers {
 class Observers {
@@ -285,8 +312,8 @@ class Observers {
 
 // CHECK: <kw>func</kw> test3(o: <type>AnyObject</type>) {
 func test3(o: AnyObject) {
-  // CHECK: <kw>let</kw> x = o <kw>as</kw>! <type>MyCls</type>
-  let x = o as! MyCls
+  // CHECK: <kw>_</kw> = o <kw>is</kw> <type>MyCls</type> ? o <kw>as</kw> <type>MyCls</type> : o <kw>as</kw>! <type>MyCls</type> <kw>as</kw> <type>MyCls</type> + <int>1</int>
+  _ = o is MyCls ? o as MyCls : o as! MyCls as MyCls + 1
 }
 
 // CHECK: <kw>class</kw> MySubClass : <type>MyCls</type> {
@@ -330,17 +357,13 @@ func funcTakingIn(in internalName: Int) {}
 _ = 123
 // CHECK: <int>123</int>
 _ = -123
-// CHECK-OLD: <int>-123</int>
-// CHECK-NEW: -<int>123</int>
+// CHECK: <int>-123</int>
 _ = -1
-// CHECK-OLD: <int>-1</int>
-// CHECK-NEW: -<int>1</int>
+// CHECK: <int>-1</int>
 _ = -0x123
-// CHECK-OLD: <int>-0x123</int>
-// CHECK-NEW: -<int>0x123</int>
+// CHECK: <int>-0x123</int>
 _ = -3.1e-5
-// CHECK-OLD: <float>-3.1e-5</float>
-// CHECK-NEW: <float>3.1e-5</float>
+// CHECK: <float>-3.1e-5</float>
 
 "--\"\(x) --"
 // CHECK: <str>"--\"</str>\<anchor>(</anchor>x<anchor>)</anchor><str> --"</str>
@@ -388,6 +411,9 @@ func keywordInCaseAndLocalArgLabel(_ for: Int, for in: Int, class _: Int) {
   case (let x, let y):
 // CHECK: <kw>case</kw> (<kw>let</kw> x, <kw>let</kw> y):
     print(x, y)
+  @unknown default:
+// CHECK: <attr-id>@unknown</attr-id> <kw>default</kw>:
+    ()
   }
 }
 
@@ -397,15 +423,43 @@ class Ownership {
   weak var w
   // CHECK: <attr-builtin>unowned</attr-builtin> <kw>var</kw> u
   unowned var u
-  // CHECK-OLD: <attr-builtin>unowned(unsafe)</attr-builtin> <kw>var</kw> uu
-  // CHECK-NEW: <attr-builtin>unowned</attr-builtin>(unsafe) <kw>var</kw> uu
+  // CHECK: <attr-builtin>unowned(unsafe)</attr-builtin> <kw>var</kw> uu
   unowned(unsafe) var uu
 }
-// CHECK-OLD: <kw>let</kw> closure = { [<attr-builtin>weak</attr-builtin> x=bindtox, <attr-builtin>unowned</attr-builtin> y=bindtoy, <attr-builtin>unowned(unsafe)</attr-builtin> z=bindtoz] <kw>in</kw> }
-// FIXME: CHECK-NEW: <kw>let</kw> closure = { [weak x=bindtox, unowned y=bindtoy, unowned(unsafe) z=bindtoz] <kw>in</kw> }
+// CHECK: <kw>let</kw> closure = { [<attr-builtin>weak</attr-builtin> x=bindtox, <attr-builtin>unowned</attr-builtin> y=bindtoy, <attr-builtin>unowned(unsafe)</attr-builtin> z=bindtoz] <kw>in</kw> }
 let closure = { [weak x=bindtox, unowned y=bindtoy, unowned(unsafe) z=bindtoz] in }
 
 protocol FakeClassRestrictedProtocol : `class` {}
-// CHECK-OLD: <kw>protocol</kw> FakeClassRestrictedProtocol : <type>`class`</type> {}
+// CHECK: <kw>protocol</kw> FakeClassRestrictedProtocol : <type>`class`</type> {}
 // FIXME: rdar://42801404: OLD and NEW should be the same '<type>`class`</type>'.
-// CHECK-NEW: <kw>protocol</kw> FakeClassRestrictedProtocol : `<type>class</type>` {}
+
+// CHECK: <kw>func</kw> foo() -> <kw>some</kw> <type>P</type> {}
+func foo() -> some P {}
+
+// CHECK: <kw>func</kw> foo() -> <kw>some</kw> <type>P</type> & <type>Q</type> {}
+func foo() -> some P & Q {}
+
+// CHECK: <kw>class</kw> PropertyDelgate {
+class PropertyDelgate {
+  // CHECK: @<type>MyDelegate</type>(<int>1</int>, receiveClosure {
+  @MyDelegate(1, receiveClosure {
+    // CHECK: <kw>var</kw> x = <int>1</int>; x
+    var x = 1; x
+  })
+  var something
+}
+
+// CHECK: <kw>func</kw> acceptBuilder<T>(
+func acceptBuilder<T>(
+  // CHECK: @<type>SomeBuilder</type><<type>Element</type>> label param: () -> <type>T</type>
+  @SomeBuilder<Element> label param: () -> T
+) {}
+
+// CHECK: <kw>func</kw> typeAttr(a: <attr-builtin>@escaping</attr-builtin> () -> <type>Int</type>) {}
+func typeAttr(a: @escaping () -> Int) {}
+
+// CHECK: <kw>func</kw> typeAttr3(a: <attr-builtin>@ escaping</attr-builtin> () -> <type>Int</type>) {}
+func typeAttr3(a: @ escaping () -> Int) {}
+
+// CHECK: <kw>func</kw> typeAttr2(a: @ <comment-block>/*this is fine...*/</comment-block> escaping () -> <type>Int</type>, b: <attr-builtin>@ escaping</attr-builtin> () -> <type>Int</type>) {}
+func typeAttr2(a: @ /*this is fine...*/ escaping () -> Int, b: @ escaping () -> Int) {}

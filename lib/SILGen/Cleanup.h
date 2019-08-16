@@ -34,6 +34,7 @@ class JumpDest;
 class SILGenFunction;
 class SILGenBuilder;
 class ManagedValue;
+class Scope;
 class SharedBorrowFormalAccess;
 class FormalEvaluationScope;
 
@@ -77,9 +78,9 @@ class LLVM_LIBRARY_VISIBILITY Cleanup {
 
   unsigned allocatedSize;
 
-protected:
   CleanupState state;
 
+protected:
   Cleanup() {}
   virtual ~Cleanup() {}
 
@@ -132,12 +133,12 @@ class LLVM_LIBRARY_VISIBILITY CleanupManager {
   /// only really care about those held by the Scope RAII objects.  So
   /// we can only reap the cleanup stack up to the innermost depth
   /// that we've handed out as a Scope.
-  CleanupsDepth innermostScope;
+  Scope *innermostScope = nullptr;
+  FormalEvaluationScope *innermostFormalScope = nullptr;
 
-  void popTopDeadCleanups(CleanupsDepth end);
+  void popTopDeadCleanups();
   void emitCleanups(CleanupsDepth depth, CleanupLocation l,
-                    ForUnwind_t forUnwind,
-                    bool popCleanups=true);
+                    ForUnwind_t forUnwind, bool popCleanups);
   void endScope(CleanupsDepth depth, CleanupLocation l);
 
   Cleanup &initCleanup(Cleanup &cleanup, size_t allocSize, CleanupState state);
@@ -149,7 +150,7 @@ class LLVM_LIBRARY_VISIBILITY CleanupManager {
 
 public:
   CleanupManager(SILGenFunction &SGF)
-      : SGF(SGF), innermostScope(stack.stable_end()) {}
+      : SGF(SGF) {}
 
   /// Return a stable reference to the last cleanup pushed.
   CleanupsDepth getCleanupsDepth() const { return stack.stable_begin(); }
@@ -159,8 +160,16 @@ public:
     assert(!stack.empty());
     return stack.stable_begin();
   }
+  
+  Cleanup &getCleanup(CleanupHandle iter) {
+    return *stack.find(iter);
+  }
 
-  /// \brief Emit a branch to the given jump destination,
+  Cleanup &findAndAdvance(CleanupsDepth &iter) {
+    return stack.findAndAdvance(iter);
+  }
+
+  /// Emit a branch to the given jump destination,
   /// threading out through any cleanups we need to run. This does not pop the
   /// cleanup stack.
   ///
@@ -173,7 +182,7 @@ public:
 
   /// emitCleanupsForReturn - Emit the top-level cleanups needed prior to a
   /// return from the function.
-  void emitCleanupsForReturn(CleanupLocation loc);
+  void emitCleanupsForReturn(CleanupLocation loc, ForUnwind_t forUnwind);
 
   /// Emit a new block that jumps to the specified location and runs necessary
   /// cleanups based on its level.  If there are no cleanups to run, this just

@@ -14,6 +14,7 @@
 #define SWIFT_FRONTEND_FRONTENDOPTIONS_H
 
 #include "swift/Basic/FileTypes.h"
+#include "swift/Basic/Version.h"
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 #include "swift/Frontend/InputFile.h"
 #include "llvm/ADT/Hashing.h"
@@ -36,7 +37,7 @@ public:
   FrontendInputsAndOutputs InputsAndOutputs;
 
   /// The kind of input on which the frontend should operate.
-  InputFileKind InputKind = InputFileKind::IFK_Swift;
+  InputFileKind InputKind = InputFileKind::Swift;
 
   void forAllOutputPaths(const InputFile &input,
                          llvm::function_ref<void(StringRef)> fn) const;
@@ -58,7 +59,7 @@ public:
   /// Arguments which should be passed in immediate mode.
   std::vector<std::string> ImmediateArgv;
 
-  /// \brief A list of arguments to forward to LLVM's option processing; this
+  /// A list of arguments to forward to LLVM's option processing; this
   /// should only be used for debugging and experimental features.
   std::vector<std::string> LLVMArgs;
 
@@ -71,9 +72,9 @@ public:
   /// The path to which we should store indexing data, if any.
   std::string IndexStorePath;
 
-  /// The path to which we should emit GraphViz output for the complete
-  /// request-evaluator graph.
-  std::string RequestEvaluatorGraphVizPath;
+  /// The path to look in when loading a parseable interface file, to see if a
+  /// binary module has already been built for use by the compiler.
+  std::string PrebuiltModuleCachePath;
 
   /// Emit index data for imported serialized swift system modules.
   bool IndexSystemModules = false;
@@ -129,6 +130,9 @@ public:
     EmitModuleOnly, ///< Emit module only
     MergeModules,   ///< Merge modules only
 
+    /// Build from a swiftinterface, as close to `import` as possible
+    CompileModuleFromInterface,
+
     EmitSIBGen, ///< Emit serialized AST + raw SIL
     EmitSIB,    ///< Emit serialized AST + canonical SIL
 
@@ -149,9 +153,14 @@ public:
   /// Indicates that the input(s) should be parsed as the Swift stdlib.
   bool ParseStdlib = false;
 
-  /// If set, emitted module files will always contain options for the
-  /// debugger to use.
-  bool AlwaysSerializeDebuggingOptions = false;
+  /// When true, emitted module files will always contain options for the
+  /// debugger to use. When unset, the options will only be present if the
+  /// module appears to not be a public module.
+  Optional<bool> SerializeOptionsForDebugging;
+
+  /// When true, check if all required SwiftOnoneSupport symbols are present in
+  /// the module.
+  bool CheckOnoneSupportCompleteness = false;
 
   /// If set, inserts instrumentation useful for testing the debugger.
   bool DebuggerTestingTransform = false;
@@ -195,10 +204,21 @@ public:
   /// \see ModuleDecl::isTestingEnabled
   bool EnableTesting = false;
 
+  /// Indicates whether we are compiling for private imports.
+  ///
+  /// \see ModuleDecl::arePrivateImportsEnabled
+  bool EnablePrivateImports = false;
+
+
+  /// Indicates whether we add implicit dynamic.
+  ///
+  /// \see ModuleDecl::isImplicitDynamicEnabled
+  bool EnableImplicitDynamic = false;
+
   /// Enables the "fully resilient" resilience strategy.
   ///
   /// \see ResilienceStrategy::Resilient
-  bool EnableResilience = false;
+  bool EnableLibraryEvolution = false;
 
   /// Indicates that the frontend should emit "verbose" SIL
   /// (if asked to emit SIL).
@@ -248,6 +268,14 @@ public:
   /// dependencies as well.
   bool TrackSystemDeps = false;
 
+  /// Should we serialize the hashes of dependencies (vs. the modification
+  /// times) when compiling a module interface?
+  bool SerializeModuleInterfaceDependencyHashes = false;
+
+  /// Should we warn if an imported module needed to be rebuilt from a
+  /// module interface file?
+  bool RemarkOnRebuildFromModuleInterface = false;
+
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {
     Default,        ///< Do the default validation for the current platform.
@@ -258,9 +286,6 @@ public:
 
   /// Compare the symbols in the IR against the TBD file we would generate.
   TBDValidationMode ValidateTBDAgainstIR = TBDValidationMode::Default;
-
-  /// The install_name to use in the TBD file.
-  std::string TBDInstallName;
 
   /// An enum with different modes for automatically crashing at defined times.
   enum class DebugCrashMode {
@@ -291,7 +316,7 @@ public:
   StringRef determineFallbackModuleName() const;
 
   bool isCompilingExactlyOneSwiftFile() const {
-    return InputKind == InputFileKind::IFK_Swift &&
+    return InputKind == InputFileKind::Swift &&
            InputsAndOutputs.hasSingleInput();
   }
 

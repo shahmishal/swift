@@ -843,11 +843,13 @@ bool CopyForwarding::doesCopyDominateDestUsers(
 // To find all SSA users of storedValue, we first find the RC root, then search
 // past any instructions that may propagate the reference.
 bool CopyForwarding::markStoredValueUsers(SILValue storedValue) {
-  if (storedValue->getType().isTrivial(*storedValue->getModule()))
+  auto *F = storedValue->getFunction();
+
+  if (storedValue->getType().isTrivial(*F))
     return true;
 
   // Find the RC root, peeking past things like struct_extract.
-  RCIdentityFunctionInfo *RCI = RCIAnalysis->get(storedValue->getFunction());
+  RCIdentityFunctionInfo *RCI = RCIAnalysis->get(F);
   SILValue root = RCI->getRCIdentityRoot(storedValue);
 
   SmallVector<SILInstruction *, 8> users;
@@ -868,7 +870,7 @@ bool CopyForwarding::markStoredValueUsers(SILValue storedValue) {
     }
     // A single-valued use is nontransitive if its result is trivial.
     if (auto *SVI = dyn_cast<SingleValueInstruction>(user)) {
-      if (SVI->getType().isTrivial(user->getModule())) {
+      if (SVI->getType().isTrivial(*F)) {
         StoredValueUserInsts.insert(user);
         continue;
       }
@@ -1200,8 +1202,19 @@ bool CopyForwarding::hoistDestroy(SILInstruction *DestroyPoint,
 
   // If DestroyPoint is a block terminator, we must hoist.
   bool MustHoist = (DestroyPoint == BB->getTerminator());
+  // If we haven't seen anything significant, avoid useless hoisting.
+  bool ShouldHoist = MustHoist;
 
-  bool IsWorthHoisting = MustHoist;
+  auto tryToInsertHoistedDestroyAfter = [&](SILInstruction *afterInst) {
+    if (!ShouldHoist)
+      return false;
+    LLVM_DEBUG(llvm::dbgs() << "  Hoisting to Use:" << *afterInst);
+    SILBuilderWithScope(std::next(afterInst->getIterator()), afterInst)
+        .createDestroyAddr(DestroyLoc, CurrentDef);
+    HasChanged = true;
+    return true;
+  };
+
   auto SI = DestroyPoint->getIterator(), SE = BB->begin();
   while (SI != SE) {
     --SI;
@@ -1219,10 +1232,10 @@ bool CopyForwarding::hoistDestroy(SILInstruction *DestroyPoint,
         // destroy_addr CurrentDef
         LLVM_DEBUG(llvm::dbgs() << "  Cannot hoist above stored value use:"
                                 << *Inst);
-        return false;
+        return tryToInsertHoistedDestroyAfter(Inst);
       }
-      if (!IsWorthHoisting && isa<ApplyInst>(Inst))
-        IsWorthHoisting = true;
+      if (!ShouldHoist && isa<ApplyInst>(Inst))
+        ShouldHoist = true;
       continue;
     }
     if (auto *CopyInst = dyn_cast<CopyAddrInst>(Inst)) {
@@ -1233,19 +1246,15 @@ bool CopyForwarding::hoistDestroy(SILInstruction *DestroyPoint,
           return true;
       }
     }
-    // We reached a user of CurrentDef. If we haven't seen anything significant,
-    // avoid useless hoisting.
-    if (!IsWorthHoisting)
-      return false;
-
-    LLVM_DEBUG(llvm::dbgs() << "  Hoisting to Use:" << *Inst);
-    SILBuilderWithScope(std::next(SI), Inst)
-        .createDestroyAddr(DestroyLoc, CurrentDef);
-    HasChanged = true;
-    return true;
+    return tryToInsertHoistedDestroyAfter(Inst);
   }
-  if (!DoGlobalHoisting)
+  if (!DoGlobalHoisting) {
+    // If DoGlobalHoisting is set, then we should never mark a DeadInBlock, so
+    // MustHoist should be false.
+    assert(!MustHoist &&
+           "Cannot hoist above a terminator with global hoisting disabled.");
     return false;
+  }
   DeadInBlocks.insert(BB);
   return true;
 }
@@ -1467,6 +1476,10 @@ class CopyForwardingPass : public SILFunctionTransform
     if (!EnableCopyForwarding && !EnableDestroyHoisting)
       return;
 
+    // FIXME: We should be able to support [ossa].
+    if (getFunction()->hasOwnership())
+      return;
+
     LLVM_DEBUG(llvm::dbgs() << "Copy Forwarding in Func "
                             << getFunction()->getName() << "\n");
 
@@ -1548,8 +1561,9 @@ class CopyForwardingPass : public SILFunctionTransform
 class TempRValueOptPass : public SILFunctionTransform {
   AliasAnalysis *AA = nullptr;
 
-  static bool collectLoads(Operand *UserOp, SILInstruction *UserInst,
+  bool collectLoads(Operand *UserOp, SILInstruction *UserInst,
                            SingleValueInstruction *Addr,
+                           SILValue srcObject,
                            llvm::SmallPtrSetImpl<SILInstruction *> &LoadInsts);
 
   bool checkNoSourceModification(CopyAddrInst *copyInst,
@@ -1562,6 +1576,9 @@ class TempRValueOptPass : public SILFunctionTransform {
 
 /// The main entry point of the pass.
 void TempRValueOptPass::run() {
+  if (getFunction()->hasOwnership())
+    return;
+
   LLVM_DEBUG(llvm::dbgs() << "Copy Peephole in Func "
                           << getFunction()->getName() << "\n");
 
@@ -1608,6 +1625,7 @@ void TempRValueOptPass::run() {
 /// reaching a load or returning false.
 bool TempRValueOptPass::collectLoads(
     Operand *userOp, SILInstruction *user, SingleValueInstruction *address,
+    SILValue srcObject,
     llvm::SmallPtrSetImpl<SILInstruction *> &loadInsts) {
   // All normal uses (loads) must be in the initialization block.
   // (The destroy and dealloc are commonly in a different block though.)
@@ -1632,22 +1650,66 @@ bool TempRValueOptPass::collectLoads(
 
   case SILInstructionKind::ApplyInst: {
     ApplySite apply(user);
+
+    // Check if the function can just read from userOp.
     auto Convention = apply.getArgumentConvention(*userOp);
-    if (Convention.isGuaranteedConvention()) {
-      loadInsts.insert(user);
-      return true;
+    if (!Convention.isGuaranteedConvention()) {
+      LLVM_DEBUG(llvm::dbgs() << "  Temp consuming use may write/destroy "
+                 "its source" << *user);
+      return false;
     }
-    LLVM_DEBUG(llvm::dbgs() << "  Temp consuming use may write/destroy "
-                               "its source"
-                            << *user);
-    return false;
+
+    // Check if there is another function argument, which is inout which might
+    // modify the source of the copy_addr.
+    //
+    // When a use of the temporary is an apply, then we need to prove that the
+    // function called by the apply cannot modify the temporary's source
+    // value. By design, this should be handled by
+    // `checkNoSourceModification`. However, this would be too conservative
+    // since it's common for the apply to have an @out argument, and alias
+    // analysis cannot prove that the @out does not alias with `src`. Instead,
+    // `checkNoSourceModification` always avoids analyzing the current use, so
+    // applies need to be handled here. We already know that an @out cannot
+    // alias with `src` because the `src` value must be initialized at the point
+    // of the call. Hence, it is sufficient to check specifically for another
+    // @inout that might alias with `src`.
+    auto calleeConv = apply.getSubstCalleeConv();
+    unsigned calleeArgIdx = apply.getCalleeArgIndexOfFirstAppliedArg();
+    for (Operand &operand : apply.getArgumentOperands()) {
+      auto argConv = calleeConv.getSILArgumentConvention(calleeArgIdx);
+      if (argConv.isInoutConvention()) {
+        if (!AA->isNoAlias(operand.get(), srcObject)) {
+          return false;
+        }
+      }
+      ++calleeArgIdx;
+    }
+
+    // Everything is okay with the function call. Register it as a "load".
+    loadInsts.insert(user);
+    return true;
+  }
+  case SILInstructionKind::OpenExistentialAddrInst: {
+    // We only support open existential addr if the access is immutable.
+    auto *oeai = cast<OpenExistentialAddrInst>(user);
+    if (oeai->getAccessKind() != OpenedExistentialAccess::Immutable) {
+      LLVM_DEBUG(llvm::dbgs() << "  Temp consuming use may write/destroy "
+                 "its source" << *user);
+      return false;
+    }
+    return true;
   }
   case SILInstructionKind::StructElementAddrInst:
   case SILInstructionKind::TupleElementAddrInst: {
     // Transitively look through projections on stack addresses.
     auto proj = cast<SingleValueInstruction>(user);
     for (auto *projUseOper : proj->getUses()) {
-      if (!collectLoads(projUseOper, projUseOper->getUser(), proj, loadInsts))
+      auto *user = projUseOper->getUser();
+      if (user->isTypeDependentOperand(*projUseOper))
+        continue;
+
+      if (!collectLoads(projUseOper, user, proj, srcObject,
+                        loadInsts))
         return false;
     }
     return true;
@@ -1737,7 +1799,7 @@ bool TempRValueOptPass::tryOptimizeCopyIntoTemp(CopyAddrInst *copyInst) {
     if (isa<DestroyAddrInst>(user) || isa<DeallocStackInst>(user))
       continue;
 
-    if (!collectLoads(useOper, user, tempObj, loadInsts))
+    if (!collectLoads(useOper, user, tempObj, copyInst->getSrc(), loadInsts))
       return false;
   }
 
@@ -1765,6 +1827,7 @@ bool TempRValueOptPass::tryOptimizeCopyIntoTemp(CopyAddrInst *copyInst) {
     case SILInstructionKind::LoadInst:
     case SILInstructionKind::LoadBorrowInst:
     case SILInstructionKind::ApplyInst:
+    case SILInstructionKind::OpenExistentialAddrInst:
       use->set(copyInst->getSrc());
       break;
 

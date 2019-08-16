@@ -11,13 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Subsystems.h"
-#include "swift/AST/AccessScopeChecker.h"
 #include "swift/AST/AccessRequests.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsCommon.h"
-#include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/Types.h"
 
 #include "llvm/Support/MathExtras.h"
@@ -36,8 +35,8 @@ namespace swift {
 //----------------------------------------------------------------------------//
 // AccessLevel computation
 //----------------------------------------------------------------------------//
-AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
-                                         ValueDecl *D) const {
+llvm::Expected<AccessLevel>
+AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
   assert(!D->hasAccess());
 
   // Check if the decl has an explicit access control attribute.
@@ -55,7 +54,6 @@ AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
       return storage->getFormalAccess();
     case AccessorKind::Set:
     case AccessorKind::MutableAddress:
-    case AccessorKind::MaterializeForSet:
     case AccessorKind::Modify:
       return storage->getSetterFormalAccess();
     case AccessorKind::WillSet:
@@ -63,6 +61,14 @@ AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
       // These are only needed to synthesize the setter.
       return AccessLevel::Private;
     }
+  }
+
+  DeclContext *DC = D->getDeclContext();
+
+  // Special case for generic parameters; we just give them a dummy
+  // access level.
+  if (auto genericParam = dyn_cast<GenericTypeParamDecl>(D)) {
+    return AccessLevel::Internal;
   }
 
   // Special case for associated types: inherit access from protocol.
@@ -82,7 +88,6 @@ AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
     }
   }
 
-  DeclContext *DC = D->getDeclContext();
   switch (DC->getContextKind()) {
   case DeclContextKind::TopLevelCodeDecl:
     // Variables declared in a top-level 'guard' statement can be accessed in
@@ -100,6 +105,7 @@ AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
   case DeclContextKind::Initializer:
   case DeclContextKind::AbstractFunctionDecl:
   case DeclContextKind::SubscriptDecl:
+  case DeclContextKind::EnumElementDecl:
     return AccessLevel::Private;
   case DeclContextKind::Module:
   case DeclContextKind::FileUnit:
@@ -114,18 +120,7 @@ AccessLevel AccessLevelRequest::evaluate(Evaluator &evaluator,
   case DeclContextKind::ExtensionDecl:
     return cast<ExtensionDecl>(DC)->getDefaultAccessLevel();
   }
-}
-
-void AccessLevelRequest::diagnoseCycle(DiagnosticEngine &diags) const {
-  // FIXME: Improve this diagnostic.
-  auto valueDecl = std::get<0>(getStorage());
-  diags.diagnose(valueDecl, diag::circular_reference);
-}
-
-void AccessLevelRequest::noteCycleStep(DiagnosticEngine &diags) const {
-  auto valueDecl = std::get<0>(getStorage());
-  // FIXME: Customize this further.
-  diags.diagnose(valueDecl, diag::circular_reference_through);
+  llvm_unreachable("unhandled kind");
 }
 
 Optional<AccessLevel> AccessLevelRequest::getCachedResult() const {
@@ -153,24 +148,37 @@ void AccessLevelRequest::cacheResult(AccessLevel value) const {
 // the cycle of computation associated with formal accesses, we give it its own
 // request.
 
-AccessLevel SetterAccessLevelRequest::evaluate(Evaluator &evaluator,
-                                               AbstractStorageDecl *ASD) const {
+// In a .swiftinterface file, a stored property with an explicit @_hasStorage
+// attribute but no setter is assumed to have originally been a private(set).
+static bool isStoredWithPrivateSetter(VarDecl *VD) {
+  auto *HSA = VD->getAttrs().getAttribute<HasStorageAttr>();
+  if (!HSA || HSA->isImplicit())
+    return false;
+
+  auto *DC = VD->getDeclContext();
+  auto *SF = DC->getParentSourceFile();
+  if (!SF || SF->Kind != SourceFileKind::Interface)
+    return false;
+
+  if (VD->isLet() ||
+      VD->getParsedAccessor(AccessorKind::Set))
+    return false;
+
+  return true;
+}
+
+llvm::Expected<AccessLevel>
+SetterAccessLevelRequest::evaluate(Evaluator &evaluator,
+                                   AbstractStorageDecl *ASD) const {
   assert(!ASD->Accessors.getInt().hasValue());
-  if (auto *AA = ASD->getAttrs().getAttribute<SetterAccessAttr>())
-    return AA->getAccess();
+  if (auto *SAA = ASD->getAttrs().getAttribute<SetterAccessAttr>())
+    return SAA->getAccess();
+
+  if (auto *VD = dyn_cast<VarDecl>(ASD))
+    if (isStoredWithPrivateSetter(VD))
+      return AccessLevel::Private;
+
   return ASD->getFormalAccess();
-}
-
-void SetterAccessLevelRequest::diagnoseCycle(DiagnosticEngine &diags) const {
-  // FIXME: Improve this diagnostic.
-  auto abstractStorageDecl = std::get<0>(getStorage());
-  diags.diagnose(abstractStorageDecl, diag::circular_reference);
-}
-
-void SetterAccessLevelRequest::noteCycleStep(DiagnosticEngine &diags) const {
-  auto abstractStorageDecl = std::get<0>(getStorage());
-  // FIXME: Customize this further.
-  diags.diagnose(abstractStorageDecl, diag::circular_reference_through);
 }
 
 Optional<AccessLevel> SetterAccessLevelRequest::getCachedResult() const {
@@ -196,63 +204,49 @@ void SetterAccessLevelRequest::cacheResult(AccessLevel value) const {
 // DefaultAccessLevel computation
 //----------------------------------------------------------------------------//
 
-std::pair<AccessLevel, AccessLevel>
+llvm::Expected<std::pair<AccessLevel, AccessLevel>>
 DefaultAndMaxAccessLevelRequest::evaluate(Evaluator &evaluator,
                                           ExtensionDecl *ED) const {
+  auto &Ctx = ED->getASTContext();
   assert(!ED->hasDefaultAccessLevel());
-
-  LazyResolver *Resolver = ED->getASTContext().getLazyResolver();
-  Resolver->resolveExtension(ED);
 
   AccessLevel maxAccess = AccessLevel::Public;
 
-  if (!ED->getExtendedType().isNull() &&
-      !ED->getExtendedType()->hasError()) {
-    if (NominalTypeDecl *nominal = ED->getExtendedType()->getAnyNominal()) {
-      maxAccess = std::max(nominal->getFormalAccess(),
-                           AccessLevel::FilePrivate);
+  if (GenericParamList *genericParams = ED->getGenericParams()) {
+    // Only check the trailing 'where' requirements. Other requirements come
+    // from the extended type and have already been checked.
+    DirectlyReferencedTypeDecls typeDecls =
+      evaluateOrDefault(Ctx.evaluator, TypeDeclsFromWhereClauseRequest{ED}, {});
+
+    Optional<AccessScope> maxScope = AccessScope::getPublic();
+
+    for (auto *typeDecl : typeDecls) {
+      if (isa<TypeAliasDecl>(typeDecl) || isa<NominalTypeDecl>(typeDecl)) {
+        auto scope = typeDecl->getFormalAccessScope(ED->getDeclContext());
+        maxScope = maxScope->intersectWith(scope);
+      }
     }
-  }
 
-  if (const GenericParamList *genericParams = ED->getGenericParams()) {
-    auto getTypeAccess = [ED](const TypeLoc &TL) -> AccessLevel {
-      if (!TL.getType())
-        return AccessLevel::Public;
-      auto accessScope =
-          TypeReprAccessScopeChecker::getAccessScope(TL.getTypeRepr(),
-                                                     ED->getDeclContext());
+    if (!maxScope.hasValue()) {
       // This is an error case and will be diagnosed elsewhere.
-      if (!accessScope.hasValue())
-        return AccessLevel::Public;
-
-      if (accessScope->isPublic())
-        return AccessLevel::Public;
-      if (isa<ModuleDecl>(accessScope->getDeclContext()))
-        return AccessLevel::Internal;
+      maxAccess = AccessLevel::Public;
+    } else if (maxScope->isPublic()) {
+      maxAccess = AccessLevel::Public;
+    } else if (isa<ModuleDecl>(maxScope->getDeclContext())) {
+      maxAccess = AccessLevel::Internal;
+    } else {
       // Because extensions are always at top-level, they should never
       // reference declarations not at the top level. (And any such references
       // should be diagnosed elsewhere.) This code should not crash if that
       // occurs, though.
-      return AccessLevel::FilePrivate;
-    };
-
-    // Only check the trailing 'where' requirements. Other requirements come
-    // from the extended type and have already been checked.
-    for (const RequirementRepr &req : genericParams->getTrailingRequirements()){
-      switch (req.getKind()) {
-      case RequirementReprKind::TypeConstraint:
-        maxAccess = std::min(getTypeAccess(req.getSubjectLoc()), maxAccess);
-        maxAccess = std::min(getTypeAccess(req.getConstraintLoc()), maxAccess);
-        break;
-      case RequirementReprKind::LayoutConstraint:
-        maxAccess = std::min(getTypeAccess(req.getSubjectLoc()), maxAccess);
-        break;
-      case RequirementReprKind::SameType:
-        maxAccess = std::min(getTypeAccess(req.getFirstTypeLoc()), maxAccess);
-        maxAccess = std::min(getTypeAccess(req.getSecondTypeLoc()), maxAccess);
-        break;
-      }
+      maxAccess = AccessLevel::FilePrivate;
     }
+  }
+
+  if (NominalTypeDecl *nominal = ED->getExtendedNominal()) {
+    maxAccess = std::min(maxAccess,
+                         std::max(nominal->getFormalAccess(),
+                                  AccessLevel::FilePrivate));
   }
 
   AccessLevel defaultAccess;
@@ -277,18 +271,6 @@ DefaultAndMaxAccessLevelRequest::evaluate(Evaluator &evaluator,
     maxAccess = AccessLevel::Public;
 
   return std::make_pair(defaultAccess, maxAccess);
-}
-
-void DefaultAndMaxAccessLevelRequest::diagnoseCycle(DiagnosticEngine &diags) const {
-  // FIXME: Improve this diagnostic.
-  auto extensionDecl = std::get<0>(getStorage());
-  diags.diagnose(extensionDecl, diag::circular_reference);
-}
-
-void DefaultAndMaxAccessLevelRequest::noteCycleStep(DiagnosticEngine &diags) const {
-  auto extensionDecl = std::get<0>(getStorage());
-  // FIXME: Customize this further.
-  diags.diagnose(extensionDecl, diag::circular_reference_through);
 }
 
 // Default and Max access levels are stored combined as a 3-bit bitset. The Bits

@@ -33,7 +33,7 @@
 ///
 /// For more information about using arrays, see `Array` and `ArraySlice`, with
 /// which `ContiguousArray` shares most properties and methods.
-@_fixed_layout
+@frozen
 public struct ContiguousArray<Element>: _DestructorSafeContainer {
   @usableFromInline
   internal typealias _Buffer = _ContiguousArrayBuffer<Element>
@@ -47,7 +47,103 @@ public struct ContiguousArray<Element>: _DestructorSafeContainer {
   internal init(_buffer: _Buffer) {
     self._buffer = _buffer
   }
+}
 
+//===--- private helpers---------------------------------------------------===//
+extension ContiguousArray {
+  @inlinable
+  @_semantics("array.get_count")
+  internal func _getCount() -> Int {
+    return _buffer.count
+  }
+
+  @inlinable
+  @_semantics("array.get_capacity")
+  internal func _getCapacity() -> Int {
+    return _buffer.capacity
+  }
+
+  @inlinable
+  @_semantics("array.make_mutable")
+  internal mutating func _makeMutableAndUnique() {
+    if _slowPath(!_buffer.isMutableAndUniquelyReferenced()) {
+      _buffer = _Buffer(copying: _buffer)
+    }
+  }
+
+  /// Check that the given `index` is valid for subscripting, i.e.
+  /// `0 ≤ index < count`.
+  @inlinable
+  @inline(__always)
+  internal func _checkSubscript_native(_ index: Int) {
+    _buffer._checkValidSubscript(index)
+  }
+
+  /// Check that the specified `index` is valid, i.e. `0 ≤ index ≤ count`.
+  @inlinable
+  @_semantics("array.check_index")
+  internal func _checkIndex(_ index: Int) {
+    _precondition(index <= endIndex, "ContiguousArray index is out of range")
+    _precondition(index >= startIndex, "Negative ContiguousArray index is out of range")
+  }
+
+  @inlinable
+  @_semantics("array.get_element_address")
+  internal func _getElementAddress(_ index: Int) -> UnsafeMutablePointer<Element> {
+    return _buffer.subscriptBaseAddress + index
+  }
+}
+
+extension ContiguousArray: _ArrayProtocol {
+  /// The total number of elements that the array can contain without
+  /// allocating new storage.
+  ///
+  /// Every array reserves a specific amount of memory to hold its contents.
+  /// When you add elements to an array and that array begins to exceed its
+  /// reserved capacity, the array allocates a larger region of memory and
+  /// copies its elements into the new storage. The new storage is a multiple
+  /// of the old storage's size. This exponential growth strategy means that
+  /// appending an element happens in constant time, averaging the performance
+  /// of many append operations. Append operations that trigger reallocation
+  /// have a performance cost, but they occur less and less often as the array
+  /// grows larger.
+  ///
+  /// The following example creates an array of integers from an array literal,
+  /// then appends the elements of another collection. Before appending, the
+  /// array allocates new storage that is large enough store the resulting
+  /// elements.
+  ///
+  ///     var numbers = [10, 20, 30, 40, 50]
+  ///     // numbers.count == 5
+  ///     // numbers.capacity == 5
+  ///
+  ///     numbers.append(contentsOf: stride(from: 60, through: 100, by: 10))
+  ///     // numbers.count == 10
+  ///     // numbers.capacity == 12
+  @inlinable
+  public var capacity: Int {
+    return _getCapacity()
+  }
+
+  /// An object that guarantees the lifetime of this array's elements.
+  @inlinable
+  public // @testable
+  var _owner: AnyObject? {
+    return _buffer.owner
+  }
+
+  /// If the elements are stored contiguously, a pointer to the first
+  /// element. Otherwise, `nil`.
+  @inlinable
+  public var _baseAddressIfContiguous: UnsafeMutablePointer<Element>? {
+    @inline(__always) // FIXME(TODO: JIRA): Hack around test failure
+    get { return _buffer.firstElementAddressIfContiguous }
+  }
+
+  @inlinable
+  internal var _baseAddress: UnsafeMutablePointer<Element> {
+    return _buffer.firstElementAddress
+  }
 }
 
 extension ContiguousArray: RandomAccessCollection, MutableCollection {
@@ -85,7 +181,6 @@ extension ContiguousArray: RandomAccessCollection, MutableCollection {
   ///     // Prints "[30, 40, 50]"
   ///
   /// If the array is empty, `endIndex` is equal to `startIndex`.
-  @inlinable // FIXME(sil-serialize-all)
   public var endIndex: Int {
     @inlinable
     get {
@@ -287,24 +382,14 @@ extension ContiguousArray: RandomAccessCollection, MutableCollection {
   @inlinable
   public subscript(index: Int) -> Element {
     get {
-      // This call may be hoisted or eliminated by the optimizer.  If
-      // there is an inout violation, this value may be stale so needs to be
-      // checked again below.
-      let wasNativeTypeChecked = _hoistableIsNativeTypeChecked()
-
-      // Make sure the index is in range and wasNativeTypeChecked is
-      // still valid.
-      let token = _checkSubscript(
-        index, wasNativeTypeChecked: wasNativeTypeChecked)
-
-      return _getElement(
-        index, wasNativeTypeChecked: wasNativeTypeChecked,
-        matchingSubscriptCheck: token)
-    }
-    mutableAddressWithPinnedNativeOwner {
-      _makeMutableAndUniqueOrPinned() // makes the array native, too
       _checkSubscript_native(index)
-      return (_getElementAddress(index), Builtin.tryPin(_getOwner_native()))
+      return _buffer.getElement(index)
+    }
+    _modify {
+      _makeMutableAndUnique()
+      _checkSubscript_native(index)
+      let address = _buffer.subscriptBaseAddress + index
+      yield &address.pointee
     }
   }
 
@@ -350,126 +435,11 @@ extension ContiguousArray: RandomAccessCollection, MutableCollection {
       }
     }
   }
-}
 
-//===--- private helpers---------------------------------------------------===//
-extension ContiguousArray {
-  /// Returns `true` if the array is native and does not need a deferred
-  /// type check.  May be hoisted by the optimizer, which means its
-  /// results may be stale by the time they are used if there is an
-  /// inout violation in user code.
+  /// The number of elements in the array.
   @inlinable
-  @_semantics("array.props.isNativeTypeChecked")
-  public // @testable
-  func _hoistableIsNativeTypeChecked() -> Bool {
-   return _buffer.arrayPropertyIsNativeTypeChecked
-  }
-
-  @inlinable
-  @_semantics("array.get_count")
-  internal func _getCount() -> Int {
-    return _buffer.count
-  }
-
-  @inlinable
-  @_semantics("array.get_capacity")
-  internal func _getCapacity() -> Int {
-    return _buffer.capacity
-  }
-
-  /// - Precondition: The array has a native buffer.
-  @inlinable
-  @_semantics("array.owner")
-  internal func _getOwnerWithSemanticLabel_native() -> Builtin.NativeObject {
-    return Builtin.unsafeCastToNativeObject(_buffer.nativeOwner)
-  }
-
-  /// - Precondition: The array has a native buffer.
-  @inlinable
-  @inline(__always)
-  internal func _getOwner_native() -> Builtin.NativeObject {
-#if _runtime(_ObjC)
-    if _isClassOrObjCExistential(Element.self) {
-      // We are hiding the access to '_buffer.owner' behind
-      // _getOwner() to help the compiler hoist uniqueness checks in
-      // the case of class or Objective-C existential typed array
-      // elements.
-      return _getOwnerWithSemanticLabel_native()
-    }
-#endif
-    // In the value typed case the extra call to
-    // _getOwnerWithSemanticLabel_native hinders optimization.
-    return Builtin.unsafeCastToNativeObject(_buffer.owner)
-  }
-
-  @inlinable
-  @_semantics("array.make_mutable")
-  internal mutating func _makeMutableAndUnique() {
-    if _slowPath(!_buffer.isMutableAndUniquelyReferenced()) {
-      _buffer = _Buffer(copying: _buffer)
-    }
-  }
-
-  @inlinable
-  @_semantics("array.make_mutable")
-  internal mutating func _makeMutableAndUniqueOrPinned() {
-    if _slowPath(!_buffer.isMutableAndUniquelyReferencedOrPinned()) {
-      _buffer = _Buffer(copying: _buffer)
-    }
-  }
-
-
-  /// Check that the given `index` is valid for subscripting, i.e.
-  /// `0 ≤ index < count`.
-  @inlinable
-  @inline(__always)
-  internal func _checkSubscript_native(_ index: Int) {
-    _buffer._checkValidSubscript(index)
-  }
-
-  /// Check that the given `index` is valid for subscripting, i.e.
-  /// `0 ≤ index < count`.
-  @inlinable
-  @_semantics("array.check_subscript")
-  public // @testable
-  func _checkSubscript(
-    _ index: Int, wasNativeTypeChecked: Bool
-  ) -> _DependenceToken {
-#if _runtime(_ObjC)
-    _buffer._checkValidSubscript(index)
-#else
-    _buffer._checkValidSubscript(index)
-#endif
-    return _DependenceToken()
-  }
-
-  /// Check that the specified `index` is valid, i.e. `0 ≤ index ≤ count`.
-  @inlinable
-  @_semantics("array.check_index")
-  internal func _checkIndex(_ index: Int) {
-    _precondition(index <= endIndex, "ContiguousArray index is out of range")
-    _precondition(index >= startIndex, "Negative ContiguousArray index is out of range")
-  }
-
-  @_semantics("array.get_element")
-  @inline(__always)
-  public // @testable
-  func _getElement(
-    _ index: Int,
-    wasNativeTypeChecked: Bool,
-    matchingSubscriptCheck: _DependenceToken
-  ) -> Element {
-#if false
-    return _buffer.getElement(index, wasNativeTypeChecked: wasNativeTypeChecked)
-#else
-    return _buffer.getElement(index)
-#endif
-  }
-
-  @inlinable
-  @_semantics("array.get_element_address")
-  internal func _getElementAddress(_ index: Int) -> UnsafeMutablePointer<Element> {
-    return _buffer.subscriptBaseAddress + index
+  public var count: Int {
+    return _getCount()
   }
 }
 
@@ -495,7 +465,7 @@ extension ContiguousArray: ExpressibleByArrayLiteral {
 }
 
 
-extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
+extension ContiguousArray: RangeReplaceableCollection {
   /// Creates a new, empty array.
   ///
   /// This is equivalent to initializing with an empty array literal.
@@ -549,13 +519,8 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   ///
   /// - Parameter s: The sequence of elements to turn into an array.
   @inlinable
-  public init<S: Sequence>(_ s: S)
-    where S.Element == Element {
-
-    self = ContiguousArray(
-      _buffer: _Buffer(
-        _buffer: s._copyToContiguousArray()._buffer,
-        shiftedToStartIndex: 0))
+  public init<S: Sequence>(_ s: S) where S.Element == Element {
+    self.init(_buffer: s._copyToContiguousArray()._buffer)
   }
 
   /// Creates a new array containing the specified number of a single, repeated
@@ -622,64 +587,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
     return (result, result._buffer.firstElementAddress)
   }
 
-
-  /// The number of elements in the array.
-  @inlinable
-  public var count: Int {
-    return _getCount()
-  }
-
-  /// The total number of elements that the array can contain without
-  /// allocating new storage.
-  ///
-  /// Every array reserves a specific amount of memory to hold its contents.
-  /// When you add elements to an array and that array begins to exceed its
-  /// reserved capacity, the array allocates a larger region of memory and
-  /// copies its elements into the new storage. The new storage is a multiple
-  /// of the old storage's size. This exponential growth strategy means that
-  /// appending an element happens in constant time, averaging the performance
-  /// of many append operations. Append operations that trigger reallocation
-  /// have a performance cost, but they occur less and less often as the array
-  /// grows larger.
-  ///
-  /// The following example creates an array of integers from an array literal,
-  /// then appends the elements of another collection. Before appending, the
-  /// array allocates new storage that is large enough store the resulting
-  /// elements.
-  ///
-  ///     var numbers = [10, 20, 30, 40, 50]
-  ///     // numbers.count == 5
-  ///     // numbers.capacity == 5
-  ///
-  ///     numbers.append(contentsOf: stride(from: 60, through: 100, by: 10))
-  ///     // numbers.count == 10
-  ///     // numbers.capacity == 12
-  @inlinable
-  public var capacity: Int {
-    return _getCapacity()
-  }
-
-  /// An object that guarantees the lifetime of this array's elements.
-  @inlinable
-  public // @testable
-  var _owner: AnyObject? {
-    return _buffer.owner
-  }
-
-  /// If the elements are stored contiguously, a pointer to the first
-  /// element. Otherwise, `nil`.
-  @inlinable
-  public var _baseAddressIfContiguous: UnsafeMutablePointer<Element>? {
-    @inline(__always) // FIXME(TODO: JIRA): Hack around test failure
-    get { return _buffer.firstElementAddressIfContiguous }
-  }
-
-  @inlinable
-  internal var _baseAddress: UnsafeMutablePointer<Element> {
-    return _buffer.firstElementAddress
-  }
   //===--- basic mutations ------------------------------------------------===//
-
 
   /// Reserves enough space to store the specified number of elements.
   ///
@@ -759,7 +667,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
       _buffer = _Buffer(
         _buffer: newBuffer, shiftedToStartIndex: _buffer.startIndex)
     }
-    _sanityCheck(capacity >= minimumCapacity)
+    _internalInvariant(capacity >= minimumCapacity)
   }
 
   /// Copy the contents of the current buffer to a new unique mutable buffer.
@@ -787,9 +695,9 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   @_semantics("array.mutate_unknown")
   internal mutating func _reserveCapacityAssumingUniqueBuffer(oldCount: Int) {
     // This is a performance optimization. This code used to be in an ||
-    // statement in the _sanityCheck below.
+    // statement in the _internalInvariant below.
     //
-    //   _sanityCheck(_buffer.capacity == 0 ||
+    //   _internalInvariant(_buffer.capacity == 0 ||
     //                _buffer.isMutableAndUniquelyReferenced())
     //
     // SR-6437
@@ -804,7 +712,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
     // This specific case is okay because we will make the buffer unique in this
     // function because we request a capacity > 0 and therefore _copyToNewBuffer
     // will be called creating a new buffer.
-    _sanityCheck(capacity ||
+    _internalInvariant(capacity ||
                  _buffer.isMutableAndUniquelyReferenced())
 
     if _slowPath(oldCount + 1 > _buffer.capacity) {
@@ -816,10 +724,10 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   @_semantics("array.mutate_unknown")
   internal mutating func _appendElementAssumeUniqueAndCapacity(
     _ oldCount: Int,
-    newElement: Element
+    newElement: __owned Element
   ) {
-    _sanityCheck(_buffer.isMutableAndUniquelyReferenced())
-    _sanityCheck(_buffer.capacity >= _buffer.count + 1)
+    _internalInvariant(_buffer.isMutableAndUniquelyReferenced())
+    _internalInvariant(_buffer.capacity >= _buffer.count + 1)
 
     _buffer.count = oldCount + 1
     (_buffer.firstElementAddress + oldCount).initialize(to: newElement)
@@ -848,7 +756,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   ///   same array.
   @inlinable
   @_semantics("array.append_element")
-  public mutating func append(_ newElement: Element) {
+  public mutating func append(_ newElement: __owned Element) {
     _makeUniqueAndReserveCapacityIfNotUnique()
     let oldCount = _getCount()
     _reserveCapacityAssumingUniqueBuffer(oldCount: oldCount)
@@ -873,7 +781,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   ///   array.
   @inlinable
   @_semantics("array.append_contentsOf")
-  public mutating func append<S: Sequence>(contentsOf newElements: S)
+  public mutating func append<S: Sequence>(contentsOf newElements: __owned S)
     where S.Element == Element {
 
     let newElementsCount = newElements.underestimatedCount
@@ -978,7 +886,7 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   /// - Complexity: O(*n*), where *n* is the length of the array. If
   ///   `i == endIndex`, this method is equivalent to `append(_:)`.
   @inlinable
-  public mutating func insert(_ newElement: Element, at i: Int) {
+  public mutating func insert(_ newElement: __owned Element, at i: Int) {
     _checkIndex(i)
     self.replaceSubrange(i..<i, with: CollectionOfOne(newElement))
   }
@@ -1013,11 +921,31 @@ extension ContiguousArray: RangeReplaceableCollection, ArrayProtocol {
   }
 
   @inlinable
-  public func _copyToContiguousArray() -> ContiguousArray<Element> {
+  public mutating func withContiguousMutableStorageIfAvailable<R>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
+  ) rethrows -> R? {
+    return try withUnsafeMutableBufferPointer {
+      (bufferPointer) -> R in
+      return try body(&bufferPointer)
+    }
+  }
+  
+  @inlinable
+  public func withContiguousStorageIfAvailable<R>(
+    _ body: (UnsafeBufferPointer<Element>) throws -> R
+  ) rethrows -> R? {
+    return try withUnsafeBufferPointer {
+      (bufferPointer) -> R in
+      return try body(bufferPointer)
+    }
+  }
+
+  @inlinable
+  public __consuming func _copyToContiguousArray() -> ContiguousArray<Element> {
     if let n = _buffer.requestNativeBuffer() {
       return ContiguousArray(_buffer: n)
     }
-    return _copyCollectionToContiguousArray(_buffer)
+    return _copyCollectionToContiguousArray(self)
   }
 }
 
@@ -1034,13 +962,13 @@ extension ContiguousArray: CustomReflectable {
 extension ContiguousArray: CustomStringConvertible, CustomDebugStringConvertible {
   /// A textual representation of the array and its elements.
   public var description: String {
-    return _makeCollectionDescription(for: self, withTypeName: nil)
+    return _makeCollectionDescription()
   }
 
   /// A textual representation of the array and its elements, suitable for
   /// debugging.
   public var debugDescription: String {
-    return _makeCollectionDescription(for: self, withTypeName: "ContiguousArray")
+    return _makeCollectionDescription(withTypeName: "ContiguousArray")
   }
 }
 
@@ -1057,6 +985,43 @@ extension ContiguousArray {
 }
 
 extension ContiguousArray {
+  /// Creates an array with the specified capacity, then calls the given
+  /// closure with a buffer covering the array's uninitialized memory.
+  ///
+  /// Inside the closure, set the `initializedCount` parameter to the number of
+  /// elements that are initialized by the closure. The memory in the range
+  /// `buffer[0..<initializedCount]` must be initialized at the end of the
+  /// closure's execution, and the memory in the range
+  /// `buffer[initializedCount...]` must be uninitialized. This postcondition
+  /// must hold even if the `initializer` closure throws an error.
+  ///
+  /// - Note: While the resulting array may have a capacity larger than the
+  ///   requested amount, the buffer passed to the closure will cover exactly
+  ///   the requested number of elements.
+  ///
+  /// - Parameters:
+  ///   - unsafeUninitializedCapacity: The number of elements to allocate
+  ///     space for in the new array.
+  ///   - initializer: A closure that initializes elements and sets the count
+  ///     of the new array.
+  ///     - Parameters:
+  ///       - buffer: A buffer covering uninitialized memory with room for the
+  ///         specified number of of elements.
+  ///       - initializedCount: The count of initialized elements in the array,
+  ///         which begins as zero. Set `initializedCount` to the number of
+  ///         elements you initialize.
+  @_alwaysEmitIntoClient @inlinable
+  public init(
+    unsafeUninitializedCapacity: Int,
+    initializingWith initializer: (
+      _ buffer: inout UnsafeMutableBufferPointer<Element>,
+      _ initializedCount: inout Int) throws -> Void
+  ) rethrows {
+    self = try ContiguousArray(Array(
+      _unsafeUninitializedCapacity: unsafeUninitializedCapacity,
+      initializingWith: initializer))
+  }
+
   /// Calls a closure with a pointer to the array's contiguous storage.
   ///
   /// Often, the optimizer can eliminate bounds checks within an array
@@ -1130,6 +1095,7 @@ extension ContiguousArray {
   ///   method's execution.
   /// - Returns: The return value, if any, of the `body` closure parameter.
   @_semantics("array.withUnsafeMutableBufferPointer")
+  @inlinable // FIXME(inline-always)
   @inline(__always) // Performance: This method should get inlined into the
   // caller such that we can combine the partial apply with the apply in this
   // function saving on allocating a closure context. This becomes unnecessary
@@ -1173,7 +1139,7 @@ extension ContiguousArray {
   }
 
   @inlinable
-  public func _copyContents(
+  public __consuming func _copyContents(
     initializing buffer: UnsafeMutableBufferPointer<Element>
   ) -> (Iterator,UnsafeMutableBufferPointer<Element>.Index) {
 
@@ -1244,7 +1210,7 @@ extension ContiguousArray {
   @_semantics("array.mutate_unknown")
   public mutating func replaceSubrange<C>(
     _ subrange: Range<Int>,
-    with newElements: C
+    with newElements: __owned C
   ) where C: Collection, C.Element == Element {
     _precondition(subrange.lowerBound >= self._buffer.startIndex,
       "ContiguousArray replace: subrange start is negative")
@@ -1291,8 +1257,8 @@ extension ContiguousArray: Equatable where Element: Equatable {
     }
 
 
-    _sanityCheck(lhs.startIndex == 0 && rhs.startIndex == 0)
-    _sanityCheck(lhs.endIndex == lhsCount && rhs.endIndex == lhsCount)
+    _internalInvariant(lhs.startIndex == 0 && rhs.startIndex == 0)
+    _internalInvariant(lhs.endIndex == lhsCount && rhs.endIndex == lhsCount)
 
     // We know that lhs.count == rhs.count, compare element wise.
     for idx in 0..<lhsCount {
@@ -1302,20 +1268,6 @@ extension ContiguousArray: Equatable where Element: Equatable {
     }
 
     return true
-  }
-
-  /// Returns a Boolean value indicating whether two arrays are not equal.
-  ///
-  /// Two arrays are equal if they contain the same elements in the same order.
-  /// You can use the not-equal-to operator (`!=`) to compare any two arrays
-  /// that store the same, `Equatable`-conforming element type.
-  ///
-  /// - Parameters:
-  ///   - lhs: An array to compare.
-  ///   - rhs: Another array to compare.
-  @inlinable
-  public static func !=(lhs: ContiguousArray<Element>, rhs: ContiguousArray<Element>) -> Bool {
-    return !(lhs == rhs)
   }
 }
 

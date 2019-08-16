@@ -15,9 +15,9 @@
 
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/OutputFileMap.h"
 #include "swift/Driver/Action.h"
 #include "swift/Driver/Util.h"
-#include "swift/Frontend/OutputFileMap.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerIntPair.h"
@@ -230,10 +230,32 @@ public:
 class Job {
 public:
   enum class Condition {
+    // There was no information about the previous build (i.e., an input map),
+    // or the map marked this Job as dirty or needing a cascading build.
+    // Be maximally conservative with dependencies.
     Always,
+    // The input changed, or this job was scheduled as non-cascading in the last
+    // build but didn't get to run.
     RunWithoutCascading,
+    // The best case: input didn't change, output exists.
+    // Only run if it depends on some other thing that changed.
     CheckDependencies,
+    // Run no matter what (but may or may not cascade).
     NewlyAdded
+  };
+
+  /// Packs together information about response file usage for a job.
+  ///
+  /// The strings in this struct must be kept alive as long as the Job is alive
+  /// (e.g., by calling MakeArgString on the arg list associated with the
+  /// Compilation).
+  struct ResponseFileInfo {
+    /// The path to the response file that a job should use.
+    const char *path;
+
+    /// The '@'-prefixed argument string that should be passed to the tool to
+    /// use the response file.
+    const char *argString;
   };
 
   using EnvironmentVector = std::vector<std::pair<const char *, const char *>>;
@@ -271,34 +293,25 @@ private:
   /// Whether the job wants a list of input or output files created.
   std::vector<FilelistInfo> FilelistFileInfos;
 
-  /// Response file path
-  const char *ResponseFilePath;
-
-  /// This contains a single argument pointing to the response file path with
-  /// the '@' prefix.
-  /// The argument string must be kept alive as long as the Job is alive.
-  const char *ResponseFileArg;
+  /// The path and argument string to use for the response file if the job's
+  /// arguments should be passed using one.
+  Optional<ResponseFileInfo> ResponseFile;
 
   /// The modification time of the main input file, if any.
   llvm::sys::TimePoint<> InputModTime = llvm::sys::TimePoint<>::max();
 
 public:
-  Job(const JobAction &Source,
-      SmallVectorImpl<const Job *> &&Inputs,
-      std::unique_ptr<CommandOutput> Output,
-      const char *Executable,
+  Job(const JobAction &Source, SmallVectorImpl<const Job *> &&Inputs,
+      std::unique_ptr<CommandOutput> Output, const char *Executable,
       llvm::opt::ArgStringList Arguments,
       EnvironmentVector ExtraEnvironment = {},
       std::vector<FilelistInfo> Infos = {},
-      const char *ResponseFilePath = nullptr,
-      const char *ResponseFileArg = nullptr)
+      Optional<ResponseFileInfo> ResponseFile = None)
       : SourceAndCondition(&Source, Condition::Always),
         Inputs(std::move(Inputs)), Output(std::move(Output)),
         Executable(Executable), Arguments(std::move(Arguments)),
         ExtraEnvironment(std::move(ExtraEnvironment)),
-        FilelistFileInfos(std::move(Infos)),
-        ResponseFilePath(ResponseFilePath),
-        ResponseFileArg(ResponseFileArg) {}
+        FilelistFileInfos(std::move(Infos)), ResponseFile(ResponseFile) {}
 
   virtual ~Job();
 
@@ -308,7 +321,10 @@ public:
 
   const char *getExecutable() const { return Executable; }
   const llvm::opt::ArgStringList &getArguments() const { return Arguments; }
-  ArrayRef<const char *> getResponseFileArg() const { return ResponseFileArg; }
+  ArrayRef<const char *> getResponseFileArg() const {
+    assert(hasResponseFile());
+    return ResponseFile->argString;
+  }
   ArrayRef<FilelistInfo> getFilelistInfos() const { return FilelistFileInfos; }
   ArrayRef<const char *> getArgumentsForTaskExecution() const;
 
@@ -352,7 +368,7 @@ public:
   /// contained within this Job; if this job is not a BatchJob, just pass \c
   /// this and the provided \p OSPid back to the Callback.
   virtual void forEachContainedJobAndPID(
-      llvm::sys::ProcessInfo::ProcessId OSPid,
+      llvm::sys::procid_t OSPid,
       llvm::function_ref<void(const Job *, Job::PID)> Callback) const {
     Callback(this, static_cast<Job::PID>(OSPid));
   }
@@ -362,7 +378,7 @@ public:
   static void printArguments(raw_ostream &Stream,
                              const llvm::opt::ArgStringList &Args);
 
-  bool hasResponseFile() const { return ResponseFilePath != nullptr; }
+  bool hasResponseFile() const { return ResponseFile.hasValue(); }
 
   bool writeArgsToResponseFile() const;
 };
@@ -390,9 +406,9 @@ public:
   BatchJob(const JobAction &Source, SmallVectorImpl<const Job *> &&Inputs,
            std::unique_ptr<CommandOutput> Output, const char *Executable,
            llvm::opt::ArgStringList Arguments,
-           EnvironmentVector ExtraEnvironment,
-           std::vector<FilelistInfo> Infos,
-           ArrayRef<const Job *> Combined, Job::PID &NextQuasiPID);
+           EnvironmentVector ExtraEnvironment, std::vector<FilelistInfo> Infos,
+           ArrayRef<const Job *> Combined, Job::PID &NextQuasiPID,
+           Optional<ResponseFileInfo> ResponseFile = None);
 
   ArrayRef<const Job*> getCombinedJobs() const {
     return CombinedJobs;
@@ -401,7 +417,7 @@ public:
   /// Call the provided callback for each Job in the batch, passing the
   /// corresponding quasi-PID with each Job.
   void forEachContainedJobAndPID(
-      llvm::sys::ProcessInfo::ProcessId OSPid,
+      llvm::sys::procid_t OSPid,
       llvm::function_ref<void(const Job *, Job::PID)> Callback) const override {
     Job::PID QPid = QuasiPIDBase;
     assert(QPid < 0);

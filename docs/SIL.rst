@@ -1,4 +1,3 @@
-.. @raise litre.TestsAreMissing
 .. highlight:: none
 
 Swift Intermediate Language (SIL)
@@ -29,7 +28,7 @@ representation that can be used for code distribution, but it can also express
 target-specific concepts as well as LLVM can.
 
 For more information on developing the implementation of SIL and SIL passes, see
-SILProgrammersManual.md.
+`SILProgrammersManual.md <SILProgrammersManual.md>`_.
 
 SIL in the Swift Compiler
 -------------------------
@@ -123,7 +122,7 @@ IR.
   high-level optimizations on basic Swift containers such as Array or String.
   Domain specific optimizations require a defined interface between
   the standard library and the optimizer. More details can be found here:
-  :ref:`HighLevelSILOptimizations`
+  `HighLevelSILOptimizations <HighLevelSILOptimizations.rst>`_
 
 Syntax
 ------
@@ -984,6 +983,7 @@ Linkage
   sil-linkage ::= 'private'
   sil-linkage ::= 'public_external'
   sil-linkage ::= 'hidden_external'
+  sil-linkage ::= 'non_abi'
 
 A linkage specifier controls the situations in which two objects in
 different SIL modules are *linked*, i.e. treated as the same object.
@@ -1047,6 +1047,25 @@ not needed.
 
 If an object has any uses, then it must be linked to a definition
 with non-external linkage.
+
+Public non-ABI linkage
+``````````````````````
+
+The `non_abi` linkage is a special linkage used for definitions which
+only exist in serialized SIL, and do not define visible symbols in the
+object file.
+
+A definition with `non_abi` linkage behaves like it has `shared` linkage,
+except that it must be serialized in the SIL module even if not referenced
+from anywhere else in the module. For example, this means it is considered
+a root for dead function elimination.
+
+When a `non_abi` definition is deserialized, it will have `shared_external`
+linkage.
+
+There is no `non_abi_external` linkage. Instead, when referencing a
+`non_abi` declaration that is defined in a different translation unit from
+the same Swift module, you must use `hidden_external` linkage.
 
 Summary
 ```````
@@ -1666,7 +1685,7 @@ typed, so aliasing of classes is constrained by the type system as follows:
 A violation of the above aliasing rules only results in undefined
 behavior if the aliasing references are dereferenced within Swift code.
 For example,
-``_SwiftNativeNS[Array|Dictionary|String]`` classes alias with
+``__SwiftNativeNS[Array|Dictionary|String]`` classes alias with
 ``NS[Array|Dictionary|String]`` classes even though they are not
 statically related. Since Swift never directly accesses stored
 properties on the Foundation classes, this aliasing does not pose a
@@ -2314,6 +2333,32 @@ with a sequence that also correctly destroys the current value.
 This instruction is only valid in Raw SIL and is rewritten as appropriate
 by the definitive initialization pass.
 
+assign_by_wrapper
+``````````````````
+::
+
+  sil-instruction ::= 'assign_by_wrapper' sil-operand 'to' sil-operand ',' 'init' sil-operand ',' 'set' sil-operand
+
+  assign_by_wrapper %0 : $S to %1 : $*T, init %2 : $F, set %3 : $G
+  // $S can be a value or address type
+  // $T must be the type of a property wrapper.
+  // $F must be a function type, taking $S as a single argument (or multiple arguments in case of a tuple) and returning $T
+  // $G must be a function type, taking $S as a single argument (or multiple arguments in case of a tuple) and without a return value
+
+Similar to the ``assign`` instruction, but the assignment is done via a
+delegate.
+
+In case of an initialization, the function ``%2`` is called with ``%0`` as
+argument. The result is stored to ``%1``. In case ``%2`` is an address type,
+it is simply passed as a first out-argument to ``%2``.
+
+In case of a re-assignment, the function ``%3`` is called with ``%0`` as
+argument. As ``%3`` is a setter (e.g. for the property in the containing
+nominal type), the destination address ``%1`` is not used in this case.
+
+This instruction is only valid in Raw SIL and is rewritten as appropriate
+by the definitive initialization pass.
+
 mark_uninitialized
 ``````````````````
 ::
@@ -2325,6 +2370,7 @@ mark_uninitialized
   mu_kind ::= 'derivedself'
   mu_kind ::= 'derivedselfonly'
   mu_kind ::= 'delegatingself'
+  mu_kind ::= 'delegatingselfallocated'
 
   %2 = mark_uninitialized [var] %1 : $*T
   // $T must be an address
@@ -2345,6 +2391,7 @@ the mark_uninitialized instruction refers to:
 - ``derivedself``: designates ``self`` in a derived (non-root) class
 - ``derivedselfonly``: designates ``self`` in a derived (non-root) class whose stored properties have already been initialized
 - ``delegatingself``: designates ``self`` on a struct, enum, or class in a delegating constructor (one that calls self.init)
+- ``delegatingselfallocated``: designates ``self`` on a class convenience initializer's initializing entry point
 
 The purpose of the ``mark_uninitialized`` instruction is to enable
 definitive initialization analysis for global variables (when marked as
@@ -2688,7 +2735,7 @@ strong reference type have ownership semantics for the referenced heap
 object. Retain and release operations, however,
 are never implicit in SIL and always must be explicitly performed where needed.
 Retains and releases on the value may be freely moved, and balancing
-retains and releases may deleted, so long as an owning retain count is
+retains and releases may be deleted, so long as an owning retain count is
 maintained for the uses of the value.
 
 All reference-counting operations are defined to work correctly on
@@ -2806,6 +2853,13 @@ which must be an initialized weak reference.  The result is value of type
 ``$Optional<T>``, except that it is ``null`` if the heap object has begun
 deallocation.
 
+If ``[take]`` is specified then the underlying weak reference is invalidated
+implying that the weak reference count of the loaded value is decremented. If
+``[take]`` is not specified then the underlying weak reference count is not
+affected by this operation (i.e. it is a +0 weak ref count operation). In either
+case, the strong reference count will be incremented before any changes to the
+weak reference count.
+
 This operation must be atomic with respect to the final ``strong_release`` on
 the operand heap object.  It need not be atomic with respect to ``store_weak``
 operations on the same address.
@@ -2824,7 +2878,13 @@ Initializes or reassigns a weak reference.  The operand may be ``nil``.
 
 If ``[initialization]`` is given, the weak reference must currently either be
 uninitialized or destroyed.  If it is not given, the weak reference must
-currently be initialized.
+currently be initialized. After the evaluation:
+
+* The value that was originally referenced by the weak reference will have
+  its weak reference count decremented by 1.
+* If the optionally typed operand is non-nil, the strong reference wrapped in
+  the optional has its weak reference count incremented by 1. In contrast, the reference's
+  strong reference count is not touched.
 
 This operation must be atomic with respect to the final ``strong_release`` on
 the operand (source) heap object.  It need not be atomic with respect to
@@ -2881,16 +2941,6 @@ The second operand may have either object or address type.  In the
 latter case, the dependency is on the current value stored in the
 address.
 
-strong_pin
-``````````
-
-TODO: Fill me in!
-
-strong_unpin
-````````````
-
-TODO: Fill me in!
-
 is_unique
 `````````
 
@@ -2909,26 +2959,11 @@ strong reference count is greater than 1.
 A discussion of the semantics can be found here:
 :ref:`arcopts.is_unique`.
 
-is_unique_or_pinned
-```````````````````
-
-::
-
-  sil-instruction ::= 'is_unique_or_pinned' sil-operand
-
-  %1 = is_unique_or_pinned %0 : $*T
-  // $T must be a reference-counted type
-  // %1 will be of type Builtin.Int1
-
-Checks whether %0 is the address of either a unique reference to a
-memory object or a reference to a pinned object. Returns 1 if the
-strong reference count is 1 or the object has been marked pinned by
-strong_pin.
-
 is_escaping_closure
 ```````````````````
 
 ::
+
   sil-instruction ::= 'is_escaping_closure' sil-operand
 
   %1 = is_escaping_closure %0 : $@callee_guaranteed () -> ()
@@ -2940,6 +2975,7 @@ true if it is.
 
 copy_block
 ``````````
+
 ::
 
   sil-instruction :: 'copy_block' sil-operand
@@ -2952,6 +2988,7 @@ if the block is copied from the stack to the heap.
 
 copy_block_without_escaping
 ```````````````````````````
+
 ::
 
   sil-instruction :: 'copy_block_without_escaping' sil-operand 'withoutEscaping' sil-operand
@@ -2983,7 +3020,7 @@ Asserts that there exists another reference of the value ``%0`` for the scope
 delineated by the call of this builtin up to the first call of a ``builtin
 "unsafeGuaranteedEnd"`` instruction that uses the second element ``%1.1`` of the
 returned value. If no such instruction can be found nothing can be assumed. This
-assertions holds for uses of the first tuple element of the returned value
+assertion holds for uses of the first tuple element of the returned value
 ``%1.0`` within this scope. The returned reference value equals the input
 ``%0``.
 
@@ -3015,6 +3052,73 @@ function_ref
   // %1 has type $T -> U
 
 Creates a reference to a SIL function.
+
+dynamic_function_ref
+````````````````````
+::
+
+  sil-instruction ::= 'dynamic_function_ref' sil-function-name ':' sil-type
+
+  %1 = dynamic_function_ref @function : $@convention(thin) T -> U
+  // $@convention(thin) T -> U must be a thin function type
+  // %1 has type $T -> U
+
+Creates a reference to a `dynamically_replacable` SIL function. A
+`dynamically_replacable` SIL function can be replaced at runtime.
+
+For the following Swift code::
+
+  dynamic func test_dynamically_replaceable() {}
+
+  func test_dynamic_call() {
+    test_dynamically_replaceable()
+  }
+
+We will generate::
+
+  sil [dynamically_replacable] @test_dynamically_replaceable : $@convention(thin) () -> () {
+  bb0:
+    %0 = tuple ()
+    return %0 : $()
+  }
+
+  sil @test_dynamic_call : $@convention(thin) () -> () {
+  bb0:
+    %0 = dynamic_function_ref @test_dynamically_replaceable : $@convention(thin) () -> ()
+    %1 = apply %0() : $@convention(thin) () -> ()
+    %2 = tuple ()
+    return %2 : $()
+  }
+
+prev_dynamic_function_ref
+`````````````````````````
+::
+
+  sil-instruction ::= 'prev_dynamic_function_ref' sil-function-name ':' sil-type
+
+  %1 = prev_dynamic_function_ref @function : $@convention(thin) T -> U
+  // $@convention(thin) T -> U must be a thin function type
+  // %1 has type $T -> U
+
+Creates a reference to a previous implemenation of a `dynamic_replacement` SIL
+function.
+
+For the following Swift code::
+
+  @_dynamicReplacement(for: test_dynamically_replaceable())
+  func test_replacement() {
+    test_dynamically_replaceable() // calls previous implementation
+  }
+
+We  will generate::
+
+  sil [dynamic_replacement_for "test_dynamically_replaceable"] @test_replacement : $@convention(thin) () -> () {
+  bb0:
+    %0 = prev_dynamic_function_ref @test_replacement : $@convention(thin) () -> ()
+    %1 = apply %0() : $@convention(thin) () -> ()
+    %2 = tuple ()
+    return %2 : $()
+  }
 
 global_addr
 ```````````
@@ -3352,11 +3456,12 @@ partial_apply
 `````````````
 ::
 
-  sil-instruction ::= 'partial_apply' callee-ownership-attr? sil-value
+  sil-instruction ::= 'partial_apply' callee-ownership-attr? on-stack-attr? sil-value
                         sil-apply-substitution-list?
                         '(' (sil-value (',' sil-value)*)? ')'
                         ':' sil-type
   callee-ownership-attr ::= '[callee_guaranteed]'
+  on-stack-attr ::= '[on_stack]'
 
   %c = partial_apply %0(%1, %2, ...) : $(Z..., A, B, ...) -> R
   // Note that the type of the callee '%0' is specified *after* the arguments
@@ -3374,12 +3479,19 @@ partial_apply
 Creates a closure by partially applying the function ``%0`` to a partial
 sequence of its arguments. In the instruction syntax, the type of the callee is
 specified after the argument list; the types of the argument and of the defined
-value are derived from the function type of the callee. The closure context will
-be allocated with retain count 1 and initialized to contain the values ``%1``,
+value are derived from the function type of the callee. If the ``partial_apply``
+has an escaping function type (not ``[on_stack]``) the closure context will be
+allocated with retain count 1 and initialized to contain the values ``%1``,
 ``%2``, etc.  The closed-over values will not be retained; that must be done
-separately before the ``partial_apply``. The closure does however take
-ownership of the partially applied arguments; when the closure reference
-count reaches zero, the contained values will be destroyed.
+separately before the ``partial_apply``. The closure does however take ownership
+of the partially applied arguments (except for ``@inout_aliasable`` parameters);
+when the closure reference count reaches zero, the contained values will be
+destroyed. If the ``partial_apply`` has a ``@noescape`` function type
+(``partial_apply [on_stack]``) the closure context is allocated on the stack and
+initialized to contain the closed-over values. The closed-over values are not
+retained, lifetime of the closed-over values must be managed separately. The
+lifetime of the stack context of a ``partial_apply [on_stack]`` must be
+terminated with a ``dealloc_stack``.
 
 If the callee is generic, all of its generic parameters must be bound by the
 given substitution list. The arguments are given with these generic
@@ -3387,6 +3499,11 @@ substitutions applied, and the resulting closure is of concrete function
 type with the given substitutions applied. The generic parameters themselves
 cannot be partially applied; all of them must be bound. The result is always
 a concrete function.
+
+If an address argument has ``@inout_aliasable`` convention, the closure
+obtained from ``partial_apply`` will not own its underlying value.
+The ``@inout_aliasable`` parameter convention is used when a ``@noescape``
+closure captures an ``inout`` argument.
 
 TODO: The instruction, when applied to a generic function,
 currently implicitly performs abstraction difference transformations enabled
@@ -3943,7 +4060,7 @@ unless the enum can be exhaustively switched in the current function, i.e. when
 the compiler can be sure that it knows all possible present and future values
 of the enum in question. This is generally true for enums defined in Swift, but
 there are two exceptions: *non-frozen enums* declared in libraries compiled
-with the ``-enable-resilience`` flag, which may grow new cases in the future in
+with the ``-enable-library-evolution`` flag, which may grow new cases in the future in
 an ABI-compatible way; and enums marked with the ``objc`` attribute, for which
 other bit patterns are permitted for compatibility with C. All enums imported
 from C are treated as "non-exhaustive" for the same reason, regardless of the
@@ -4293,7 +4410,7 @@ open_existential_addr
   //   type P
   // $*@opened P must be a unique archetype that refers to an opened
   // existential type P.
-  // %1 will be of type $*P
+  // %1 will be of type $*@opened P
 
 Obtains the address of the concrete value inside the existential
 container referenced by ``%0``. The protocol conformances associated
@@ -4316,7 +4433,7 @@ open_existential_value
   //   type P
   // $@opened P must be a unique archetype that refers to an opened
   // existential type P.
-  // %1 will be of type $P
+  // %1 will be of type $@opened P
 
 Loadable version of the above: Opens-up the existential
 container associated with ``%0``. The protocol conformances associated
@@ -4714,7 +4831,9 @@ convert_function
 ````````````````
 ::
 
-  sil-instruction ::= 'convert_function' sil-operand 'to' sil-type
+  sil-instruction ::= 'convert_function' sil-operand 'to'
+                      ('[' 'without_actually_escaping' ']')?
+                      sil-type
 
   %1 = convert_function %0 : $T -> U to $T' -> U'
   // %0 must be of a function type $T -> U ABI-compatible with $T' -> U'
@@ -4744,6 +4863,18 @@ without ``@noescape`` are ABI compatible because they have no context. To
 convert from an escaping to a ``@noescape`` thick function type use
 ``convert_escape_to_noescape``.
 
+With the ``without_actually_escaping`` attribute, the
+``convert_function`` may be used to convert a non-escaping closure
+into an escaping function type. This attribute must be present
+whenever the closure operand has an unboxed capture (via
+@inout_aliasable) *and* the resulting function type is escaping. (This
+only happens as a result of withoutActuallyEscaping()). If the
+attribute is present then the resulting function type must be
+escaping, but the operand's function type may or may not be
+@noescape. Note that a non-escaping closure may have unboxed captured
+even though its SIL function type is "escaping".
+
+
 convert_escape_to_noescape
 ```````````````````````````
 ::
@@ -4754,7 +4885,7 @@ convert_escape_to_noescape
   //   (see convert_function)
   // %1 will be of the trivial type $@noescape T -> U
 
-Converts an escaping (non-trivial) function type to an ``@noescape`` trivial
+Converts an escaping (non-trivial) function type to a ``@noescape`` trivial
 function type. Something must guarantee the lifetime of the input ``%0`` for the
 duration of the use ``%1``.
 
@@ -4762,7 +4893,7 @@ A ``convert_escape_to_noescape [not_guaranteed] %opd`` indicates that the
 lifetime of its operand was not guaranteed by SILGen and a mandatory pass must
 be run to ensure the lifetime of ``%opd``` for the conversion's uses.
 
-A ``convert_escape_to_noescape [escaped]`` indiciates that the result was
+A ``convert_escape_to_noescape [escaped]`` indicates that the result was
 passed to a function (materializeForSet) which escapes the closure in a way not
 expressed by the convert's users. The mandatory pass must ensure the lifetime
 in a conservative way.
@@ -4985,13 +5116,15 @@ cond_fail
 `````````
 ::
 
-  sil-instruction ::= 'cond_fail' sil-operand
+  sil-instruction ::= 'cond_fail' sil-operand, string-literal
 
-  cond_fail %0 : $Builtin.Int1
+  cond_fail %0 : $Builtin.Int1, "failure reason"
   // %0 must be of type $Builtin.Int1
 
 This instruction produces a `runtime failure`_ if the operand is one.
 Execution proceeds normally if the operand is zero.
+The second operand is a static failure message, which is displayed by the
+debugger in case the failure is triggered.
 
 Terminators
 ~~~~~~~~~~~

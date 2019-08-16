@@ -34,16 +34,17 @@ namespace swift {
   class TypeChecker;
   class ValueDecl;
 
-/// \brief Emit diagnostics for syntactic restrictions on a given expression.
+/// Emit diagnostics for syntactic restrictions on a given expression.
 void performSyntacticExprDiagnostics(TypeChecker &TC, const Expr *E,
                                      const DeclContext *DC,
                                      bool isExprStmt);
 
-/// \brief Emit diagnostics for a given statement.
+/// Emit diagnostics for a given statement.
 void performStmtDiagnostics(TypeChecker &TC, const Stmt *S);
 
 void performAbstractFuncDeclDiagnostics(TypeChecker &TC,
-                                        AbstractFunctionDecl *AFD);
+                                        AbstractFunctionDecl *AFD,
+                                        BraceStmt *body);
 
 /// Perform diagnostics on the top level code declaration.
 void performTopLevelDeclDiagnostics(TypeChecker &TC, TopLevelCodeDecl *TLCD);
@@ -51,8 +52,11 @@ void performTopLevelDeclDiagnostics(TypeChecker &TC, TopLevelCodeDecl *TLCD);
 /// Emit a fix-it to set the access of \p VD to \p desiredAccess.
 ///
 /// This actually updates \p VD as well.
-void fixItAccess(InFlightDiagnostic &diag, ValueDecl *VD,
-                 AccessLevel desiredAccess, bool isForSetter = false);
+void fixItAccess(InFlightDiagnostic &diag,
+                 ValueDecl *VD,
+                 AccessLevel desiredAccess,
+                 bool isForSetter = false,
+                 bool shouldUseDefaultAccess = false);
 
 /// Emit fix-its to correct the argument labels in \p expr, which is the
 /// argument tuple or single argument of a call.
@@ -62,7 +66,7 @@ void fixItAccess(InFlightDiagnostic &diag, ValueDecl *VD,
 ///
 /// \returns true if the issue was diagnosed
 bool diagnoseArgumentLabelError(ASTContext &ctx,
-                                const Expr *expr,
+                                Expr *expr,
                                 ArrayRef<Identifier> newNames,
                                 bool isSubscript,
                                 InFlightDiagnostic *existingDiag = nullptr);

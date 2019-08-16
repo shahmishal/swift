@@ -22,12 +22,12 @@
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILDebugScope.h"
+#include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILPrintContext.h"
 #include "llvm/ADT/StringMap.h"
 
 /// The symbol name used for the program entry point function.
-/// FIXME: Hardcoding this is lame.
 #define SWIFT_ENTRY_POINT_FUNCTION "main"
 
 namespace swift {
@@ -38,6 +38,11 @@ class SILModule;
 class SILFunctionBuilder;
 class SILProfiler;
 
+namespace Lowering {
+class TypeLowering;
+class AbstractionPattern;
+}
+
 enum IsBare_t { IsNotBare, IsBare };
 enum IsTransparent_t { IsNotTransparent, IsTransparent };
 enum Inline_t { InlineDefault, NoInline, AlwaysInline };
@@ -46,6 +51,14 @@ enum IsThunk_t {
   IsThunk,
   IsReabstractionThunk,
   IsSignatureOptimizedThunk
+};
+enum IsDynamicallyReplaceable_t {
+  IsNotDynamic,
+  IsDynamic
+};
+enum IsExactSelfClass_t {
+  IsNotExactSelfClass,
+  IsExactSelfClass,
 };
 
 class SILSpecializeAttr final {
@@ -145,6 +158,12 @@ private:
   /// disabled.
   SILProfiler *Profiler = nullptr;
 
+  /// The function this function is meant to replace. Null if this is not a
+  /// @_dynamicReplacement(for:) function.
+  SILFunction *ReplacedFunction = nullptr;
+
+  Identifier ObjCReplacementFor;
+
   /// The function's bare attribute. Bare means that the function is SIL-only
   /// and does not require debug info.
   unsigned Bare : 1;
@@ -181,6 +200,13 @@ private:
 
   /// Whether cross-module references to this function should use weak linking.
   unsigned IsWeakLinked : 1;
+
+  /// Whether the implementation can be dynamically replaced.
+  unsigned IsDynamicReplaceable : 1;
+    
+  /// If true, this indicates that a class method implementation will always be
+  /// invoked with a `self` argument of the exact base class type.
+  unsigned ExactSelfClass : 1;
 
   /// If != OptimizationMode::NotSet, the optimization mode specified with an
   /// function attribute.
@@ -219,17 +245,26 @@ private:
   /// *) It is a function referenced by the specialization information.
   bool Zombie = false;
 
-  /// True if SILOwnership is enabled for this function.
+  /// True if this function is in Ownership SSA form and thus must pass
+  /// ownership verification.
   ///
   /// This enables the verifier to easily prove that before the Ownership Model
   /// Eliminator runs on a function, we only see a non-semantic-arc world and
   /// after the pass runs, we only see a semantic-arc world.
-  bool HasQualifiedOwnership = true;
+  bool HasOwnership = true;
 
   /// Set if the function body was deserialized from canonical SIL. This implies
   /// that the function's home module performed SIL diagnostics prior to
   /// serialization.
   bool WasDeserializedCanonical = false;
+
+  /// True if this is a reabstraction thunk of escaping function type whose
+  /// single argument is a potentially non-escaping closure. This is an escape
+  /// hatch to allow non-escaping functions to be stored or passed as an
+  /// argument with escaping function type. The thunk argument's function type
+  /// is not necessarily @noescape. The only relevant aspect of the argument is
+  /// that it may have unboxed capture (i.e. @inout_aliasable parameters).
+  bool IsWithoutActuallyEscapingThunk = false;
 
   static void
   validateSubclassScope(SubclassScope scope, IsThunk_t isThunk,
@@ -265,19 +300,29 @@ private:
               ProfileCounter entryCount, IsThunk_t isThunk,
               SubclassScope classSubclassScope, Inline_t inlineStrategy,
               EffectsKind E, SILFunction *insertBefore,
-              const SILDebugScope *debugScope);
+              const SILDebugScope *debugScope,
+              IsDynamicallyReplaceable_t isDynamic,
+              IsExactSelfClass_t isExactSelfClass);
 
   static SILFunction *
   create(SILModule &M, SILLinkage linkage, StringRef name,
          CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
          Optional<SILLocation> loc, IsBare_t isBareSILFunction,
          IsTransparent_t isTrans, IsSerialized_t isSerialized,
-         ProfileCounter entryCount, IsThunk_t isThunk = IsNotThunk,
+         ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
+         IsExactSelfClass_t isExactSelfClass,
+         IsThunk_t isThunk = IsNotThunk,
          SubclassScope classSubclassScope = SubclassScope::NotApplicable,
          Inline_t inlineStrategy = InlineDefault,
          EffectsKind EffectsKindAttr = EffectsKind::Unspecified,
          SILFunction *InsertBefore = nullptr,
          const SILDebugScope *DebugScope = nullptr);
+
+  /// Set has ownership to the given value. True means that the function has
+  /// ownership, false means it does not.
+  ///
+  /// Only for use by FunctionBuilders!
+  void setHasOwnership(bool newValue) { HasOwnership = newValue; }
 
 public:
   ~SILFunction();
@@ -296,12 +341,45 @@ public:
 
   SILProfiler *getProfiler() const { return Profiler; }
 
+  SILFunction *getDynamicallyReplacedFunction() const {
+    return ReplacedFunction;
+  }
+  void setDynamicallyReplacedFunction(SILFunction *f) {
+    assert(ReplacedFunction == nullptr && "already set");
+    assert(!hasObjCReplacement());
+
+    if (f == nullptr)
+      return;
+    ReplacedFunction = f;
+    ReplacedFunction->incrementRefCount();
+  }
+
+  /// This function should only be called when SILFunctions are bulk deleted.
+  void dropDynamicallyReplacedFunction() {
+    if (!ReplacedFunction)
+      return;
+    ReplacedFunction->decrementRefCount();
+    ReplacedFunction = nullptr;
+  }
+
+  bool hasObjCReplacement() const {
+    return !ObjCReplacementFor.empty();
+  }
+
+  Identifier getObjCReplacement() const {
+    return ObjCReplacementFor;
+  }
+
+  void setObjCReplacement(AbstractFunctionDecl *replacedDecl);
+  void setObjCReplacement(Identifier replacedDecl);
+
   void setProfiler(SILProfiler *InheritedProfiler) {
     assert(!Profiler && "Function already has a profiler");
     Profiler = InheritedProfiler;
   }
 
-  void createProfiler(ASTNode Root, ForDefinition_t forDefinition);
+  void createProfiler(ASTNode Root, SILDeclRef forDecl,
+                      ForDefinition_t forDefinition);
 
   void discardProfiler() { Profiler = nullptr; }
 
@@ -368,13 +446,11 @@ public:
   bool isZombie() const { return Zombie; }
 
   /// Returns true if this function has qualified ownership instructions in it.
-  bool hasQualifiedOwnership() const { return HasQualifiedOwnership; }
+  bool hasOwnership() const { return HasOwnership; }
 
-  /// Sets the HasQualifiedOwnership flag to false. This signals to SIL that no
+  /// Sets the HasOwnership flag to false. This signals to SIL that no
   /// ownership instructions should be in this function any more.
-  void setUnqualifiedOwnership() {
-    HasQualifiedOwnership = false;
-  }
+  void setOwnershipEliminated() { setHasOwnership(false); }
 
   /// Returns true if this function was deserialized from canonical
   /// SIL. (.swiftmodule files contain canonical SIL; .sib files may be 'raw'
@@ -383,6 +459,18 @@ public:
 
   void setWasDeserializedCanonical(bool val = true) {
     WasDeserializedCanonical = val;
+  }
+
+  /// Returns true if this is a reabstraction thunk of escaping function type
+  /// whose single argument is a potentially non-escaping closure. i.e. the
+  /// thunks' function argument may itself have @inout_aliasable parameters.
+  bool isWithoutActuallyEscapingThunk() const {
+    return IsWithoutActuallyEscapingThunk;
+  }
+
+  void setWithoutActuallyEscapingThunk(bool val = true) {
+    assert(!val || isThunk() == IsReabstractionThunk);
+    IsWithoutActuallyEscapingThunk = val;
   }
 
   /// Returns the calling convention used by this entry point.
@@ -395,6 +483,21 @@ public:
             ? ResilienceExpansion::Minimal
             : ResilienceExpansion::Maximal);
   }
+
+  const Lowering::TypeLowering &
+  getTypeLowering(Lowering::AbstractionPattern orig, Type subst);
+
+  const Lowering::TypeLowering &getTypeLowering(Type t) const;
+
+  SILType getLoweredType(Lowering::AbstractionPattern orig, Type subst) const;
+
+  SILType getLoweredType(Type t) const;
+
+  SILType getLoweredLoadableType(Type t) const;
+
+  const Lowering::TypeLowering &getTypeLowering(SILType type) const;
+
+  bool isTypeABIAccessible(SILType type) const;
 
   /// Returns true if this function has a calling convention that has a self
   /// argument.
@@ -495,6 +598,22 @@ public:
   void setWeakLinked(bool value = true) {
     assert(!IsWeakLinked && "already set");
     IsWeakLinked = value;
+  }
+
+  /// Returns whether this function implementation can be dynamically replaced.
+  IsDynamicallyReplaceable_t isDynamicallyReplaceable() const {
+    return IsDynamicallyReplaceable_t(IsDynamicReplaceable);
+  }
+  void setIsDynamic(IsDynamicallyReplaceable_t value = IsDynamic) {
+    IsDynamicReplaceable = value;
+    assert(!Transparent || !IsDynamicReplaceable);
+  }
+    
+  IsExactSelfClass_t isExactSelfClass() const {
+    return IsExactSelfClass_t(ExactSelfClass);
+  }
+  void setIsExactSelfClass(IsExactSelfClass_t t) {
+    ExactSelfClass = t;
   }
 
   /// Get the DeclContext of this function. (Debug info only).
@@ -599,7 +718,10 @@ public:
 
   /// Get this function's transparent attribute.
   IsTransparent_t isTransparent() const { return IsTransparent_t(Transparent); }
-  void setTransparent(IsTransparent_t isT) { Transparent = isT; }
+  void setTransparent(IsTransparent_t isT) {
+    Transparent = isT;
+    assert(!Transparent || !IsDynamicReplaceable);
+  }
 
   /// Get this function's serialized attribute.
   IsSerialized_t isSerialized() const { return IsSerialized_t(Serialized); }
@@ -633,7 +755,7 @@ public:
     return EffectsKindAttr != EffectsKind::Unspecified;
   }
 
-  /// \brief Set the function side effect information.
+  /// Set the function side effect information.
   void setEffectsKind(EffectsKind E) {
     EffectsKindAttr = E;
   }
@@ -754,7 +876,8 @@ public:
   const SILBasicBlock *getEntryBlock() const { return &front(); }
 
   SILBasicBlock *createBasicBlock();
-  SILBasicBlock *createBasicBlock(SILBasicBlock *After);
+  SILBasicBlock *createBasicBlockAfter(SILBasicBlock *afterBB);
+  SILBasicBlock *createBasicBlockBefore(SILBasicBlock *beforeBB);
 
   /// Splice the body of \p F into this function at end.
   void spliceBody(SILFunction *F) {
@@ -862,6 +985,11 @@ public:
   /// invariants.
   void verify(bool SingleFunction = true) const;
 
+  /// Verify that all non-cond-br critical edges have been split.
+  ///
+  /// This is a fast subset of the checks performed in the SILVerifier.
+  void verifyCriticalEdges() const;
+
   /// Pretty-print the SILFunction.
   void dump(bool Verbose) const;
   void dump() const;
@@ -923,7 +1051,7 @@ namespace llvm {
 
 template <>
 struct ilist_traits<::swift::SILFunction> :
-public ilist_default_traits<::swift::SILFunction> {
+public ilist_node_traits<::swift::SILFunction> {
   using SILFunction = ::swift::SILFunction;
 
 public:

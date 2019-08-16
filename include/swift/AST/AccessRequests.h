@@ -32,24 +32,19 @@ class ValueDecl;
 /// Request the AccessLevel of the given ValueDecl.
 class AccessLevelRequest :
     public SimpleRequest<AccessLevelRequest,
-                         CacheKind::SeparatelyCached,
-                         AccessLevel,
-                         ValueDecl *> {
+                         AccessLevel(ValueDecl *),
+                         CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
-  AccessLevel evaluate(Evaluator &evaluator, ValueDecl *decl) const;
+  llvm::Expected<AccessLevel> evaluate(Evaluator &evaluator,
+                                       ValueDecl *decl) const;
 
 public:
-  // Cycle handling
-  AccessLevel breakCycle() const { return AccessLevel::Private; }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
-
   // Separate caching.
   bool isCached() const { return true; }
   Optional<AccessLevel> getCachedResult() const;
@@ -61,24 +56,19 @@ public:
 /// the accessibility of mutating accessors.
 class SetterAccessLevelRequest :
     public SimpleRequest<SetterAccessLevelRequest,
-                         CacheKind::SeparatelyCached,
-                         AccessLevel,
-                         AbstractStorageDecl *> {
+                         AccessLevel(AbstractStorageDecl *),
+                         CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
-  AccessLevel evaluate(Evaluator &evaluator, AbstractStorageDecl *decl) const;
+  llvm::Expected<AccessLevel>
+  evaluate(Evaluator &evaluator, AbstractStorageDecl *decl) const;
 
 public:
-  // Cycle handling
-  AccessLevel breakCycle() const { return AccessLevel::Private; }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
-
   // Separate caching.
   bool isCached() const { return true; }
   Optional<AccessLevel> getCachedResult() const;
@@ -88,27 +78,19 @@ public:
 /// Request the Default and Max AccessLevels of the given ExtensionDecl.
 class DefaultAndMaxAccessLevelRequest :
     public SimpleRequest<DefaultAndMaxAccessLevelRequest,
-                         CacheKind::SeparatelyCached,
-                         std::pair<AccessLevel, AccessLevel>,
-                         ExtensionDecl *> {
+                         std::pair<AccessLevel, AccessLevel>(ExtensionDecl *),
+                         CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
   using DefaultAndMax = std::pair<AccessLevel, AccessLevel>;
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
-  DefaultAndMax
+  llvm::Expected<DefaultAndMax>
   evaluate(Evaluator &evaluator, ExtensionDecl *decl) const;
 
 public:
-  // Cycle handling
-  DefaultAndMax
-  breakCycle() const { return std::make_pair(AccessLevel::Private,
-                                             AccessLevel::Private); }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
-
   // Separate caching.
   bool isCached() const { return true; }
   Optional<DefaultAndMax> getCachedResult() const;

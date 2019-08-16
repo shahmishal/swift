@@ -39,9 +39,10 @@ static bool canDeriveConformance(NominalTypeDecl *type) {
 }
 
 /// Derive the implementation of allCases for a "simple" no-payload enum.
-void deriveCaseIterable_enum_getter(AbstractFunctionDecl *funcDecl) {
+std::pair<BraceStmt *, bool>
+deriveCaseIterable_enum_getter(AbstractFunctionDecl *funcDecl, void *) {
   auto *parentDC = funcDecl->getDeclContext();
-  auto *parentEnum = parentDC->getAsEnumOrEnumExtensionContext();
+  auto *parentEnum = parentDC->getSelfEnumDecl();
   auto enumTy = parentDC->getDeclaredTypeInContext();
   auto &C = parentDC->getASTContext();
 
@@ -57,15 +58,15 @@ void deriveCaseIterable_enum_getter(AbstractFunctionDecl *funcDecl) {
   auto *returnStmt = new (C) ReturnStmt(SourceLoc(), arrayExpr);
   auto *body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                  SourceLoc());
-  funcDecl->setBody(body);
+  return { body, /*isTypeChecked=*/false };
 }
 
-static ArraySliceType *computeAllCasesType(NominalTypeDecl *enumType) {
-  auto metaTy = enumType->getDeclaredInterfaceType();
-  if (!metaTy || metaTy->hasError())
+static ArraySliceType *computeAllCasesType(NominalTypeDecl *enumDecl) {
+  auto enumType = enumDecl->getDeclaredInterfaceType();
+  if (!enumType || enumType->hasError())
     return nullptr;
 
-  return ArraySliceType::get(metaTy->getRValueInstanceType());
+  return ArraySliceType::get(enumType);
 }
 
 static Type deriveCaseIterable_AllCases(DerivedConformance &derived) {
@@ -86,13 +87,14 @@ ValueDecl *DerivedConformance::deriveCaseIterable(ValueDecl *requirement) {
   if (!canDeriveConformance(Nominal))
     return nullptr;
 
+  ASTContext &C = TC.Context;
+
   // Build the necessary decl.
-  if (requirement->getBaseName() != TC.Context.Id_allCases) {
-    TC.diagnose(requirement->getLoc(), diag::broken_case_iterable_requirement);
+  if (requirement->getBaseName() != C.Id_allCases) {
+    requirement->diagnose(diag::broken_case_iterable_requirement);
     return nullptr;
   }
 
-  ASTContext &C = TC.Context;
 
   // Define the property.
   auto *returnTy = computeAllCasesType(Nominal);
@@ -104,11 +106,11 @@ ValueDecl *DerivedConformance::deriveCaseIterable(ValueDecl *requirement) {
                              /*isStatic=*/true, /*isFinal=*/true);
 
   // Define the getter.
-  auto *getterDecl = addGetterToReadOnlyDerivedProperty(TC, propDecl, returnTy);
+  auto *getterDecl = addGetterToReadOnlyDerivedProperty(propDecl, returnTy);
 
   getterDecl->setBodySynthesizer(&deriveCaseIterable_enum_getter);
 
-  addMembersToConformanceContext({getterDecl, propDecl, pbDecl});
+  addMembersToConformanceContext({propDecl, pbDecl});
 
   return propDecl;
 }

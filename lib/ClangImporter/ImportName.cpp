@@ -265,7 +265,7 @@ static OptionalTypeKind getResultOptionality(
   return OTK_ImplicitlyUnwrappedOptional;
 }
 
-/// \brief Determine whether the given name is reserved for Swift.
+/// Determine whether the given name is reserved for Swift.
 static bool isSwiftReservedName(StringRef name) {
   tok kind = Lexer::kindOfIdentifier(name, /*InSILMode=*/false);
   return (kind != tok::identifier);
@@ -552,7 +552,7 @@ namespace {
 /// For a SwiftVersionedRemovalAttr, the Attr member will be null.
 struct VersionedSwiftNameInfo {
   const clang::SwiftNameAttr *Attr;
-  clang::VersionTuple Version;
+  llvm::VersionTuple Version;
   bool IsReplacedByActive;
 };
 
@@ -573,7 +573,7 @@ enum class VersionedSwiftNameAction {
 
 static VersionedSwiftNameAction
 checkVersionedSwiftName(VersionedSwiftNameInfo info,
-                        clang::VersionTuple bestSoFar,
+                        llvm::VersionTuple bestSoFar,
                         ImportNameVersion requestedVersion) {
   if (!bestSoFar.empty() && bestSoFar <= info.Version)
     return VersionedSwiftNameAction::Ignore;
@@ -624,7 +624,7 @@ findSwiftNameAttr(const clang::Decl *decl, ImportNameVersion version) {
 
     const auto *activeAttr = decl->getAttr<clang::SwiftNameAttr>();
     const clang::SwiftNameAttr *result = activeAttr;
-    clang::VersionTuple bestSoFar;
+    llvm::VersionTuple bestSoFar;
     for (auto *attr : decl->attrs()) {
       VersionedSwiftNameInfo info;
 
@@ -797,7 +797,7 @@ static bool shouldImportAsInitializer(const clang::ObjCMethodDecl *method,
 static bool omitNeedlessWordsInFunctionName(
     StringRef &baseName, SmallVectorImpl<StringRef> &argumentNames,
     ArrayRef<const clang::ParmVarDecl *> params, clang::QualType resultType,
-    const clang::DeclContext *dc, const llvm::SmallBitVector &nonNullArgs,
+    const clang::DeclContext *dc, const SmallBitVector &nonNullArgs,
     Optional<unsigned> errorParamIndex, bool returnsSelf, bool isInstanceMethod,
     NameImporter &nameImporter) {
   clang::ASTContext &clangCtx = nameImporter.getClangContext();
@@ -1404,8 +1404,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
   case clang::DeclarationName::CXXOperatorName:
   case clang::DeclarationName::CXXUsingDirective:
   case clang::DeclarationName::CXXDeductionGuideName:
-    // Handling these is part of C++ interoperability.
-    llvm_unreachable("unhandled C++ interoperability");
+    // TODO: Handling these is part of C++ interoperability.
+    return ImportedName();
 
   case clang::DeclarationName::Identifier:
     // Map the identifier.
@@ -1729,9 +1729,14 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
 /// Returns true if it is expected that the macro is ignored.
 static bool shouldIgnoreMacro(StringRef name, const clang::MacroInfo *macro) {
-  // Ignore include guards.
-  if (macro->isUsedForHeaderGuard())
-    return true;
+  // Ignore include guards. Try not to ignore definitions of useful constants,
+  // which may end up looking like include guards.
+  if (macro->isUsedForHeaderGuard() && macro->getNumTokens() == 1) {
+    auto tok = macro->tokens()[0];
+    if (tok.isLiteral()
+        && StringRef(tok.getLiteralData(), tok.getLength()) == "1")
+      return true;
+  }
 
   // If there are no tokens, there is nothing to convert.
   if (macro->tokens_empty())

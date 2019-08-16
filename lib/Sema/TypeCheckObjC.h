@@ -49,6 +49,8 @@ public:
     ExplicitlyIBOutlet,
     /// Has an explicit '@IBAction' attribute.
     ExplicitlyIBAction,
+    /// Has an explicit '@IBSegueAction' attribute.
+    ExplicitlyIBSegueAction,
     /// Has an explicit '@NSManaged' attribute.
     ExplicitlyNSManaged,
     /// Is a member of an @objc protocol.
@@ -65,10 +67,15 @@ public:
     ExplicitlyGKInspectable,
     /// Is it a member of an @objc extension of a class.
     MemberOfObjCExtension,
+
+    // These kinds do not appear in diagnostics.
+
     /// Is it a member of an @objcMembers class.
     MemberOfObjCMembersClass,
     /// A member of an Objective-C-defined class or subclass.
     MemberOfObjCSubclass,
+    /// Is a member of an @objc enum.
+    ElementOfObjCEnum,
     /// An accessor to a property.
     Accessor,
   };

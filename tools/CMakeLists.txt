@@ -11,6 +11,7 @@ endif()
 
 # Add generated libSyntax headers to global dependencies.
 list(APPEND LLVM_COMMON_DEPENDS swift-syntax-generated-headers)
+list(APPEND LLVM_COMMON_DEPENDS swift-parse-syntax-generated-headers)
 if(SWIFT_BUILD_SOURCEKIT)
   list(APPEND LLVM_COMMON_DEPENDS generated_sourcekit_uids)
 endif()
@@ -28,11 +29,17 @@ add_swift_tool_subdirectory(sil-nm)
 add_swift_tool_subdirectory(sil-passpipeline-dumper)
 add_swift_tool_subdirectory(swift-llvm-opt)
 add_swift_tool_subdirectory(swift-api-digester)
+add_swift_tool_subdirectory(swift-ast-script)
 add_swift_tool_subdirectory(swift-syntax-test)
 add_swift_tool_subdirectory(swift-refactor)
+if(SWIFT_BUILD_SYNTAXPARSERLIB)
+  add_swift_tool_subdirectory(libSwiftSyntaxParser)
+  add_swift_tool_subdirectory(swift-syntax-parser-test)
+endif()
 
 if(LLVM_USE_SANITIZE_COVERAGE)
 add_swift_tool_subdirectory(swift-demangle-fuzzer)
+add_swift_tool_subdirectory(swift-reflection-fuzzer)
 endif()
 
 if(SWIFT_BUILD_STDLIB AND SWIFT_BUILD_SDK_OVERLAY)
@@ -48,19 +55,6 @@ endif()
 if(SWIFT_HOST_VARIANT STREQUAL "macosx")
   # Only build Darwin-specific tools when deploying to OS X.
   add_swift_tool_subdirectory(swift-stdlib-tool)
-
-  # SwiftSyntax depends on both the standard library (because it's a
-  # Swift module), and the SDK overlays (because it depends on Foundation).
-  # Ensure we only build SwiftSyntax when we're building both.
-  if(BUILD_FOUNDATION)
-    add_subdirectory(SwiftSyntax)
-    add_subdirectory(swift-test-utils)
-    add_swift_tool_subdirectory(swift-swiftsyntax-test)
-  endif()
 endif()
 
-
-is_sdk_requested("${SWIFT_HOST_VARIANT_SDK}" SWIFT_HOST_SDK_REQUESTED)
-if(SWIFT_BUILD_STDLIB AND SWIFT_HOST_SDK_REQUESTED)
-  add_swift_tool_subdirectory(swift-reflection-dump)
-endif()
+add_swift_tool_subdirectory(swift-reflection-dump)

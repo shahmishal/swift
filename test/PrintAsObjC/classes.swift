@@ -223,6 +223,7 @@ class NotObjC {}
 // CHECK-NEXT: - (void)testDictionaryBridging3:(NSDictionary<NSString *, NSString *> * _Nonnull)a;
 // CHECK-NEXT: - (void)testSetBridging:(NSSet * _Nonnull)a;
 // CHECK-NEXT: - (IBAction)actionMethod:(id _Nonnull)_;
+// CHECK-NEXT: - (IBSegueAction NSObject * _Nonnull)segueActionMethod:(NSCoder * _Nonnull)coder sender:(id _Nonnull)sender SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: - (void)methodWithReservedParameterNames:(id _Nonnull)long_ protected:(id _Nonnull)protected_;
 // CHECK-NEXT: - (void)honorRenames:(CustomName * _Nonnull)_;
 // CHECK-NEXT: - (Methods * _Nullable __unsafe_unretained)unmanaged:(id _Nonnull __unsafe_unretained)_ SWIFT_WARN_UNUSED_RESULT;
@@ -280,6 +281,7 @@ class NotObjC {}
   @objc func testSetBridging(_ a: Set<NSObject>) {}
 
   @IBAction func actionMethod(_: AnyObject) {}
+  @IBSegueAction func segueActionMethod(_ coder: NSCoder, sender: Any) -> NSObject { fatalError() }
 
   @objc func methodWithReservedParameterNames(_ long: AnyObject, protected: AnyObject) {}
 
@@ -503,7 +505,7 @@ public class NonObjCClass { }
 // CHECK-NEXT: SWIFT_CLASS_PROPERTY(@property (nonatomic, class, readonly, strong) Properties * _Nonnull sharedRO;)
 // CHECK-NEXT: + (Properties * _Nonnull)sharedRO SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: @property (nonatomic, weak) Properties * _Nullable weakOther;
-// CHECK-NEXT: @property (nonatomic, assign) Properties * _Nonnull unownedOther;
+// CHECK-NEXT: @property (nonatomic, unsafe_unretained) Properties * _Nonnull unownedOther;
 // CHECK-NEXT: @property (nonatomic, unsafe_unretained) Properties * _Nonnull unmanagedOther;
 // CHECK-NEXT: @property (nonatomic, unsafe_unretained) Properties * _Nullable unmanagedByDecl;
 // CHECK-NEXT: @property (nonatomic, weak) id <MyProtocol> _Nullable weakProto;
@@ -805,3 +807,9 @@ public class NonObjCClass { }
   @objc func referenceSingleGenericClass(_: SingleImportedObjCGeneric<AnyObject>?) {}
 }
 // CHECK: @end
+
+// CHECK: SWIFT_WEAK_IMPORT
+// CHECK-NEXT: SWIFT_CLASS("_TtC7classes17WeakImportedClass")
+// CHECK-NEXT: @interface WeakImportedClass
+// CHECK-NEXT: @end
+@_weakLinked @objc class WeakImportedClass {}

@@ -90,7 +90,7 @@ namespace {
                         bool isMemberLookup)
       : Result(result), DC(dc), Options(options),
         IsMemberLookup(isMemberLookup) {
-      if (!dc->getASTContext().LangOpts.EnableAccessControl)
+      if (dc->getASTContext().isAccessControlDisabled())
         Options |= NameLookupFlags::IgnoreAccessControl;
     }
 
@@ -231,17 +231,16 @@ namespace {
 
       // Dig out the protocol conformance.
       auto *foundProto = cast<ProtocolDecl>(foundDC);
-      auto resolver = DC->getASTContext().getLazyResolver();
-      assert(resolver && "Need an active resolver");
-      auto &tc = *static_cast<TypeChecker *>(resolver);
-      auto conformance = tc.conformsToProtocol(conformingType, foundProto, DC,
-                                               conformanceOptions);
+      auto conformance = TypeChecker::conformsToProtocol(conformingType,
+                                                         foundProto, DC,
+                                                         conformanceOptions);
       if (!conformance) {
         // If there's no conformance, we have an existential
         // and we found a member from one of the protocols, and
         // not a class constraint if any.
-        assert(foundInType->isExistentialType());
-        addResult(found);
+        assert(foundInType->isExistentialType() || foundInType->hasError());
+        if (foundInType->isExistentialType())
+          addResult(found);
         return;
       }
 
@@ -256,10 +255,10 @@ namespace {
       ValueDecl *witness = nullptr;
       auto concrete = conformance->getConcrete();
       if (auto assocType = dyn_cast<AssociatedTypeDecl>(found)) {
-        witness = concrete->getTypeWitnessAndDecl(assocType, nullptr)
+        witness = concrete->getTypeWitnessAndDecl(assocType)
           .second;
       } else if (found->isProtocolRequirement()) {
-        witness = concrete->getWitnessDecl(found, nullptr);
+        witness = concrete->getWitnessDecl(found);
 
         // It is possible that a requirement is visible to us, but
         // not the witness. In this case, just return the requirement;
@@ -369,13 +368,14 @@ LookupResult TypeChecker::lookupMember(DeclContext *dc,
   NLOptions subOptions = NL_QualifiedDefault;
   if (options.contains(NameLookupFlags::KnownPrivate))
     subOptions |= NL_KnownNonCascadingDependency;
-  if (options.contains(NameLookupFlags::DynamicLookup))
-    subOptions |= NL_DynamicLookup;
   if (options.contains(NameLookupFlags::IgnoreAccessControl))
     subOptions |= NL_IgnoreAccessControl;
 
   if (options.contains(NameLookupFlags::ProtocolMembers))
     subOptions |= NL_ProtocolMembers;
+
+  if (options.contains(NameLookupFlags::IncludeAttributeImplements))
+    subOptions |= NL_IncludeAttributeImplements;
 
   // We handle our own overriding/shadowing filtering.
   subOptions &= ~NL_RemoveOverridden;
@@ -418,7 +418,7 @@ bool TypeChecker::isUnsupportedMemberTypeAccess(Type type, TypeDecl *typeDecl) {
   }
 
   if (type->isExistentialType() &&
-      typeDecl->getDeclContext()->getAsProtocolOrProtocolExtensionContext()) {
+      typeDecl->getDeclContext()->getSelfProtocolDecl()) {
     // TODO: Temporarily allow typealias and associated type lookup on
     //       existential type iff it doesn't have any type parameters.
     if (isa<TypeAliasDecl>(typeDecl) || isa<AssociatedTypeDecl>(typeDecl))
@@ -448,7 +448,7 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
   if (options.contains(NameLookupFlags::IgnoreAccessControl))
     subOptions |= NL_IgnoreAccessControl;
 
-  if (!dc->lookupQualified(type, name, subOptions, this, decls))
+  if (!dc->lookupQualified(type, name, subOptions, nullptr, decls))
     return result;
 
   // Look through the declarations, keeping only the unique type declarations.
@@ -458,9 +458,11 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
     auto *typeDecl = cast<TypeDecl>(decl);
 
     // FIXME: This should happen before we attempt shadowing checks.
-    validateDecl(typeDecl);
-    if (!typeDecl->hasInterfaceType()) // FIXME: recursion-breaking hack
-      continue;
+    if (!typeDecl->hasInterfaceType()) {
+      dc->getASTContext().getLazyResolver()->resolveDeclSignature(typeDecl);
+      if (!typeDecl->hasInterfaceType()) // FIXME: recursion-breaking hack
+        continue;
+    }
 
     auto memberType = typeDecl->getDeclaredInterfaceType();
 
@@ -476,7 +478,7 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
     // If we're looking up an associated type of a concrete type,
     // record it later for conformance checking; we might find a more
     // direct typealias with the same name later.
-    if (typeDecl->getDeclContext()->getAsProtocolOrProtocolExtensionContext()) {
+    if (typeDecl->getDeclContext()->getSelfProtocolDecl()) {
       if (auto assocType = dyn_cast<AssociatedTypeDecl>(typeDecl)) {
         if (!type->is<ArchetypeType>() &&
             !type->isTypeParameter()) {
@@ -549,9 +551,12 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
           ProtocolConformanceState::CheckingTypeWitnesses)
         continue;
 
-      auto typeDecl = concrete->getTypeWitnessAndDecl(assocType, this).second;
+      auto typeDecl =
+        concrete->getTypeWitnessAndDecl(assocType).second;
 
-      assert(typeDecl && "Missing type witness?");
+      // Circularity.
+      if (!typeDecl)
+        continue;
 
       auto memberType =
           substMemberTypeWithBase(dc->getParentModule(), typeDecl, type);
@@ -568,18 +573,9 @@ LookupResult TypeChecker::lookupConstructors(DeclContext *dc, Type type,
   return lookupMember(dc, type, DeclBaseName::createConstructor(), options);
 }
 
-enum : unsigned {
-  /// Never consider a candidate that's this distance away or worse.
-  UnreasonableCallEditDistance = 8,
-
-  /// Don't consider candidates that score worse than the given distance
-  /// from the best candidate.
-  MaxCallEditDistanceFromBestCandidate = 1
-};
-
-static unsigned getCallEditDistance(DeclName writtenName,
-                                    DeclName correctedName,
-                                    unsigned maxEditDistance) {
+unsigned TypeChecker::getCallEditDistance(DeclName writtenName,
+                                          DeclName correctedName,
+                                          unsigned maxEditDistance) {
   // TODO: consider arguments.
   // TODO: maybe ignore certain kinds of missing / present labels for the
   //   first argument label?
@@ -595,6 +591,12 @@ static unsigned getCallEditDistance(DeclName writtenName,
 
   StringRef writtenBase = writtenName.getBaseName().userFacingName();
   StringRef correctedBase = correctedName.getBaseName().userFacingName();
+
+  // Don't typo-correct to a name with a leading underscore unless the typed
+  // name also begins with an underscore.
+  if (correctedBase.startswith("_") && !writtenBase.startswith("_")) {
+    return UnreasonableCallEditDistance;
+  }
 
   unsigned distance = writtenBase.edit_distance(correctedBase, maxEditDistance);
 
@@ -625,15 +627,6 @@ static bool isPlausibleTypo(DeclRefKind refKind, DeclName typedName,
   return true;
 }
 
-static bool isLocInVarInit(TypeChecker &TC, VarDecl *var, SourceLoc loc) {
-  auto binding = var->getParentPatternBinding();
-  if (!binding || binding->isImplicit())
-    return false;
-
-  auto initRange = binding->getSourceRange();
-  return TC.Context.SourceMgr.rangeContainsTokenLoc(initRange, loc);
-}
-
 void TypeChecker::performTypoCorrection(DeclContext *DC, DeclRefKind refKind,
                                         Type baseTypeOrNull,
                                         NameLookupOptions lookupOptions,
@@ -657,12 +650,6 @@ void TypeChecker::performTypoCorrection(DeclContext *DC, DeclRefKind refKind,
     // not a plausible typo.
     if (!isPlausibleTypo(refKind, corrections.WrittenName, decl))
       return;
-
-    // Don't suggest a variable within its own initializer.
-    if (auto var = dyn_cast<VarDecl>(decl)) {
-      if (isLocInVarInit(*this, var, corrections.Loc.getBaseNameLoc()))
-        return;
-    }
 
     auto candidateName = decl->getFullName();
 

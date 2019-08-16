@@ -54,7 +54,7 @@ typedef llvm::DenseMap<DomTreeNode *, unsigned> DomTreeLevelMap;
 
 /// Promotes a single AllocStackInst into registers..
 class StackAllocationPromoter {
-  typedef llvm::DenseSet<SILBasicBlock *> BlockSet;
+  typedef llvm::SmallSetVector<SILBasicBlock *, 16> BlockSet;
   typedef llvm::DenseMap<SILBasicBlock *, SILInstruction *> BlockToInstMap;
 
   // Use a priority queue keyed on dominator tree level so that inserted nodes
@@ -104,37 +104,37 @@ public:
   void run();
 
 private:
-  /// \brief Promote AllocStacks into SSA.
+  /// Promote AllocStacks into SSA.
   void promoteAllocationToPhi();
 
-  /// \brief Replace the dummy nodes with new block arguments.
+  /// Replace the dummy nodes with new block arguments.
   void addBlockArguments(BlockSet &PhiBlocks);
 
-  /// \brief Fix all of the branch instructions and the uses to use
+  /// Fix all of the branch instructions and the uses to use
   /// the AllocStack definitions (which include stores and Phis).
   void fixBranchesAndUses(BlockSet &Blocks);
 
-  /// \brief update the branch instructions with the new Phi argument.
+  /// update the branch instructions with the new Phi argument.
   /// The blocks in \p PhiBlocks are blocks that define a value, \p Dest is
   /// the branch destination, and \p Pred is the predecessors who's branch we
   /// modify.
   void fixPhiPredBlock(BlockSet &PhiBlocks, SILBasicBlock *Dest,
                        SILBasicBlock *Pred);
 
-  /// \brief Get the value for this AllocStack variable that is
+  /// Get the value for this AllocStack variable that is
   /// flowing out of StartBB.
   SILValue getLiveOutValue(BlockSet &PhiBlocks, SILBasicBlock *StartBB);
 
-  /// \brief Get the value for this AllocStack variable that is
+  /// Get the value for this AllocStack variable that is
   /// flowing into BB.
   SILValue getLiveInValue(BlockSet &PhiBlocks, SILBasicBlock *BB);
 
-  /// \brief Prune AllocStacks usage in the function. Scan the function
+  /// Prune AllocStacks usage in the function. Scan the function
   /// and remove in-block usage of the AllocStack. Leave only the first
   /// load and the last store.
   void pruneAllocStackUsage();
 
-  /// \brief Promote all of the AllocStacks in a single basic block in one
+  /// Promote all of the AllocStacks in a single basic block in one
   /// linear scan. This function deletes all of the loads and stores except
   /// for the first load and the last store.
   /// \returns the last StoreInst found or zero if none found.
@@ -155,10 +155,10 @@ class MemoryToRegisters {
   /// The builder used to create new instructions during register promotion.
   SILBuilder B;
 
-  /// \brief Check if the AllocStackInst \p ASI is only written into.
+  /// Check if the AllocStackInst \p ASI is only written into.
   bool isWriteOnlyAllocation(AllocStackInst *ASI);
 
-  /// \brief Promote all of the AllocStacks in a single basic block in one
+  /// Promote all of the AllocStacks in a single basic block in one
   /// linear scan. Note: This function deletes all of the users of the
   /// AllocStackInst, including the DeallocStackInst but it does not remove the
   /// AllocStackInst itself!
@@ -174,7 +174,7 @@ public:
   MemoryToRegisters(SILFunction &Func, DominanceInfo *Dt) : F(Func), DT(Dt),
                                                             B(Func) {}
 
-  /// \brief Promote memory to registers. Return True on change.
+  /// Promote memory to registers. Return True on change.
   bool run();
 };
 
@@ -188,7 +188,8 @@ static bool isAddressForLoad(SILInstruction *I, SILBasicBlock *&singleBlock) {
   if (isa<LoadInst>(I))
     return true;
 
-  if (!isa<StructElementAddrInst>(I) && !isa<TupleElementAddrInst>(I))
+  if (!isa<UncheckedAddrCastInst>(I) && !isa<StructElementAddrInst>(I) &&
+      !isa<TupleElementAddrInst>(I))
     return false;
   
   // Recursively search for other (non-)loads in the instruction's uses.
@@ -199,6 +200,21 @@ static bool isAddressForLoad(SILInstruction *I, SILBasicBlock *&singleBlock) {
     
     if (!isAddressForLoad(II, singleBlock))
         return false;
+  }
+  return true;
+}
+
+/// Returns true if \p I is a dead struct_element_addr or tuple_element_addr.
+static bool isDeadAddrProjection(SILInstruction *I) {
+  if (!isa<UncheckedAddrCastInst>(I) && !isa<StructElementAddrInst>(I) &&
+      !isa<TupleElementAddrInst>(I))
+    return false;
+
+  // Recursively search for uses which are dead themselves.
+  for (auto UI : cast<SingleValueInstruction>(I)->getUses()) {
+    SILInstruction *II = UI->getUser();
+    if (!isDeadAddrProjection(II))
+      return false;
   }
   return true;
 }
@@ -233,7 +249,7 @@ static bool isCaptured(AllocStackInst *ASI, bool &inSingleBlock) {
     // Destroys of loadable types can be rewritten as releases, so
     // they are fine.
     if (auto *DAI = dyn_cast<DestroyAddrInst>(II))
-      if (DAI->getOperand()->getType().isLoadable(DAI->getModule()))
+      if (DAI->getOperand()->getType().isLoadable(*DAI->getFunction()))
         continue;
 
     // Other instructions are assumed to capture the AllocStack.
@@ -266,6 +282,9 @@ bool MemoryToRegisters::isWriteOnlyAllocation(AllocStackInst *ASI) {
     if (isa<DebugValueAddrInst>(II))
       continue;
 
+    if (isDeadAddrProjection(II))
+      continue;
+
     // Can't do anything else with it.
     LLVM_DEBUG(llvm::dbgs() << "*** AllocStack has non-write use: " << *II);
     return false;
@@ -277,7 +296,7 @@ bool MemoryToRegisters::isWriteOnlyAllocation(AllocStackInst *ASI) {
 /// Promote a DebugValueAddr to a DebugValue of the given value.
 static void
 promoteDebugValueAddr(DebugValueAddrInst *DVAI, SILValue Value, SILBuilder &B) {
-  assert(DVAI->getOperand()->getType().isLoadable(DVAI->getModule()) &&
+  assert(DVAI->getOperand()->getType().isLoadable(*DVAI->getFunction()) &&
          "Unexpected promotion of address-only type!");
   assert(Value && "Expected valid value");
   B.setInsertionPoint(DVAI);
@@ -294,7 +313,8 @@ static bool isLoadFromStack(SILInstruction *I, AllocStackInst *ASI) {
   // Skip struct and tuple address projections.
   ValueBase *op = I->getOperand(0);
   while (op != ASI) {
-    if (!isa<StructElementAddrInst>(op) && !isa<TupleElementAddrInst>(op))
+    if (!isa<UncheckedAddrCastInst>(op) && !isa<StructElementAddrInst>(op) &&
+        !isa<TupleElementAddrInst>(op))
       return false;
     
     op = cast<SingleValueInstruction>(op)->getOperand(0);
@@ -308,7 +328,8 @@ static void collectLoads(SILInstruction *I, SmallVectorImpl<LoadInst *> &Loads) 
     Loads.push_back(load);
     return;
   }
-  if (!isa<StructElementAddrInst>(I) && !isa<TupleElementAddrInst>(I))
+  if (!isa<UncheckedAddrCastInst>(I) && !isa<StructElementAddrInst>(I) &&
+      !isa<TupleElementAddrInst>(I))
     return;
   
   // Recursively search for other loads in the instruction's uses.
@@ -322,7 +343,8 @@ static void replaceLoad(LoadInst *LI, SILValue val, AllocStackInst *ASI) {
   ProjectionPath projections(val->getType());
   SILValue op = LI->getOperand();
   while (op != ASI) {
-    assert(isa<StructElementAddrInst>(op) || isa<TupleElementAddrInst>(op));
+    assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
+           isa<TupleElementAddrInst>(op));
     auto *Inst = cast<SingleValueInstruction>(op);
     projections.push_back(Projection(Inst));
     op = Inst->getOperand(0);
@@ -336,7 +358,8 @@ static void replaceLoad(LoadInst *LI, SILValue val, AllocStackInst *ASI) {
   LI->replaceAllUsesWith(val);
   LI->eraseFromParent();
   while (op != ASI && op->use_empty()) {
-    assert(isa<StructElementAddrInst>(op) || isa<TupleElementAddrInst>(op));
+    assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
+           isa<TupleElementAddrInst>(op));
     auto *Inst = cast<SingleValueInstruction>(op);
     SILValue next = Inst->getOperand(0);
     Inst->eraseFromParent();
@@ -345,7 +368,9 @@ static void replaceLoad(LoadInst *LI, SILValue val, AllocStackInst *ASI) {
 }
 
 static void replaceDestroy(DestroyAddrInst *DAI, SILValue NewValue) {
-  assert(DAI->getOperand()->getType().isLoadable(DAI->getModule()) &&
+  SILFunction *F = DAI->getFunction();
+
+  assert(DAI->getOperand()->getType().isLoadable(*F) &&
          "Unexpected promotion of address-only type!");
 
   assert(NewValue && "Expected a value to release!");
@@ -353,7 +378,7 @@ static void replaceDestroy(DestroyAddrInst *DAI, SILValue NewValue) {
   SILBuilderWithScope Builder(DAI);
 
   auto Ty = DAI->getOperand()->getType();
-  auto &TL = DAI->getModule().getTypeLowering(Ty);
+  auto &TL = F->getTypeLowering(Ty);
 
   bool expand = shouldExpand(DAI->getModule(),
                              DAI->getOperand()->getType().getObjectType());
@@ -468,9 +493,9 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *ASI) {
     // with our running value.
     if (isLoadFromStack(Inst, ASI)) {
       if (!RunningVal) {
-        assert(ASI->getElementType().isVoid() &&
-               "Expected initialization of non-void type!");
-        RunningVal = SILUndef::get(ASI->getElementType(), ASI->getModule());
+        // Loading without a previous store is only acceptable if the type is
+        // Void (= empty tuple) or a tuple of Voids.
+        RunningVal = SILUndef::get(ASI->getElementType(), *ASI->getFunction());
       }
       replaceLoad(cast<LoadInst>(Inst), RunningVal, ASI);
       NumInstRemoved++;
@@ -524,7 +549,8 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *ASI) {
     // Remove dead address instructions that may be uses of the allocation.
     SILNode *Node = Inst;
     while (isa<StructElementAddrInst>(Node) ||
-           isa<TupleElementAddrInst>(Node)) {
+           isa<TupleElementAddrInst>(Node) ||
+           isa<UncheckedAddrCastInst>(Node)) {
       auto *I = cast<SingleValueInstruction>(Node);
       if (!I->use_empty()) break;
       Node = I->getOperand(0);
@@ -538,7 +564,7 @@ void StackAllocationPromoter::addBlockArguments(BlockSet &PhiBlocks) {
   LLVM_DEBUG(llvm::dbgs() << "*** Adding new block arguments.\n");
 
   for (auto *Block : PhiBlocks)
-    Block->createPHIArgument(ASI->getElementType(), ValueOwnershipKind::Owned);
+    Block->createPhiArgument(ASI->getElementType(), ValueOwnershipKind::Owned);
 }
 
 SILValue
@@ -570,7 +596,7 @@ StackAllocationPromoter::getLiveOutValue(BlockSet &PhiBlocks,
     LLVM_DEBUG(llvm::dbgs() << "*** Walking up the iDOM.\n");
   }
   LLVM_DEBUG(llvm::dbgs() << "*** Could not find a Def. Using Undef.\n");
-  return SILUndef::get(ASI->getElementType(), ASI->getModule());
+  return SILUndef::get(ASI->getElementType(), *ASI->getFunction());
 }
 
 SILValue
@@ -586,7 +612,7 @@ StackAllocationPromoter::getLiveInValue(BlockSet &PhiBlocks,
   }
 
   if (BB->pred_empty() || !DT->getNode(BB))
-    return SILUndef::get(ASI->getElementType(), ASI->getModule());
+    return SILUndef::get(ASI->getElementType(), *ASI->getFunction());
 
   // No phi for this value in this block means that the value flowing
   // out of the immediate dominator reaches here.
@@ -794,7 +820,7 @@ void StackAllocationPromoter::promoteAllocationToPhi() {
 
         // The successor node is a new PHINode. If this is a new PHI node
         // then it may require additional definitions, so add it to the PQ.
-        if (PhiBlocks.insert(Succ).second)
+        if (PhiBlocks.insert(Succ))
           PQ.push(std::make_pair(SuccNode, SuccLevel));
       }
 
@@ -889,7 +915,7 @@ bool MemoryToRegisters::promoteSingleAllocation(AllocStackInst *alloc,
 bool MemoryToRegisters::run() {
   bool Changed = false;
 
-  Changed = splitAllCriticalEdges(F, true, DT, nullptr);
+  F.verifyCriticalEdges();
 
   // Compute dominator tree node levels for the function.
   DomTreeLevelMap DomTreeLevels;
@@ -923,6 +949,11 @@ class SILMem2Reg : public SILFunctionTransform {
 
   void run() override {
     SILFunction *F = getFunction();
+
+    // FIXME: We should be able to support ownership.
+    if (F->hasOwnership())
+      return;
+
     LLVM_DEBUG(llvm::dbgs() << "** Mem2Reg on function: " << F->getName()
                             << " **\n");
 

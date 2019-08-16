@@ -6,6 +6,7 @@
 
 // FIXME: Add a feature for "platforms that support XCTest".
 // REQUIRES: OS=macosx
+// UNSUPPORTED: remote_run
 
 import StdlibUnittest
 
@@ -112,7 +113,7 @@ XCTestTestSuite.test("XCTAssertEqual/T") {
   let failingTestRun = failingTestCase.testRun!
   expectEqual(1, failingTestRun.failureCount)
   expectEqual(0, failingTestRun.unexpectedExceptionCount)
-  expectEqual(observer.failureDescription, "XCTAssertEqual failed: (\"1\") is not equal to (\"2\") - ")
+  expectTrue(observer.failureDescription!.starts(with:  "XCTAssertEqual failed: (\"1\") is not equal to (\"2\")"))
 }
 
 XCTestTestSuite.test("XCTAssertEqual/Optional<T>") {
@@ -146,7 +147,7 @@ XCTestTestSuite.test("XCTAssertEqual/Optional<T>") {
   expectEqual(0, failingTestRun.unexpectedExceptionCount)
   expectEqual(1, failingTestRun.totalFailureCount)
   expectFalse(failingTestRun.hasSucceeded)
-  expectEqual(observer.failureDescription, "XCTAssertEqual failed: (\"Optional(1)\") is not equal to (\"Optional(2)\") - ")
+  expectTrue(observer.failureDescription!.starts(with:  "XCTAssertEqual failed: (\"Optional(1)\") is not equal to (\"Optional(2)\")"))
 }
 
 XCTestTestSuite.test("XCTAssertEqual/Array<T>") {

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift -g -Onone -DUSE_STDLIBUNITTEST %s -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out
 // REQUIRES: executable_test
 
@@ -572,7 +573,7 @@ extension Collection {
 }
 
 extension LazyCollectionProtocol
-where Element == Elements.Element {
+where Element == Elements.Element, Elements: Collection {
   func stablyPartitioned(
     isSuffixElement p: (Element) -> Bool
   ) -> LazyCollection<[Element]> {

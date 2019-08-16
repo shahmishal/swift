@@ -168,6 +168,15 @@ bool FrontendInputsAndOutputs::shouldTreatAsLLVM() const {
   return false;
 }
 
+bool FrontendInputsAndOutputs::shouldTreatAsModuleInterface() const {
+  if (!hasSingleInput())
+    return false;
+
+  StringRef InputExt = llvm::sys::path::extension(getFilenameOfFirstInput());
+  file_types::ID InputType = file_types::lookupTypeForExtension(InputExt);
+  return InputType == file_types::TY_SwiftParseableInterfaceFile;
+}
+
 bool FrontendInputsAndOutputs::shouldTreatAsSIL() const {
   if (hasSingleInput()) {
     // If we have exactly one input filename, and its extension is "sil",
@@ -426,10 +435,10 @@ bool FrontendInputsAndOutputs::hasModuleDocOutputPath() const {
         return outs.ModuleDocOutputPath;
       });
 }
-bool FrontendInputsAndOutputs::hasModuleInterfaceOutputPath() const {
+bool FrontendInputsAndOutputs::hasParseableInterfaceOutputPath() const {
   return hasSupplementaryOutputPath(
       [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleInterfaceOutputPath;
+        return outs.ParseableInterfaceOutputPath;
       });
 }
 bool FrontendInputsAndOutputs::hasTBDPath() const {

@@ -1,7 +1,4 @@
-// We need to require macOS because swiftSyntax currently doesn't build on Linux
-// REQUIRES: OS=macosx
 // RUN: %target-swift-ide-test -syntax-coloring -source-filename %s -D CONF | %FileCheck %s
-// RUN: %swift-swiftsyntax-test -classify-syntax -source-file %s | %FileCheck %s
 
 // CHECK: <kw>var</kw> f : <type>Int</type>
 var f : Int
@@ -338,6 +335,13 @@ class NestedPoundIf {
 func foo() {
 // CHECK: <kw>if</kw> <kw>#available</kw> (<kw>OSX</kw> <float>10.10</float>, <kw>iOS</kw> <float>8.01</float>, *) {<kw>let</kw> <kw>_</kw> = <str>"iOS"</str>}
   if #available (OSX 10.10, iOS 8.01, *) {let _ = "iOS"}
+}
+
+class AvailableWithOverride {
+  // CHECK: <attr-builtin>@available</attr-builtin>(<kw>iOS</kw> <float>8.01</float>, <kw>OSX</kw> <float>10.10</float>, *)
+  @available(iOS 8.01, OSX 10.10, *)
+  // CHECK: <attr-builtin>public</attr-builtin> <attr-builtin>override</attr-builtin> <kw>var</kw> multiple: <type>Int</type> { <kw>return</kw> <int>24</int> }
+  public override var multiple: Int { return 24 }
 }
 
 // CHECK: <kw>func</kw> test4(<kw>inout</kw> a: <type>Int</type>) {{{$}}

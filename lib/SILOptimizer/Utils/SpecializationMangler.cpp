@@ -33,7 +33,7 @@ class AttributeDemangler : public Demangle::Demangler {
 public:
   void demangleAndAddAsChildren(StringRef MangledSpecialization,
                                 NodePointer Parent) {
-    init(MangledSpecialization);
+    DemangleInitRAII state(*this, MangledSpecialization);
     if (!parseAndPushNodes()) {
       llvm::errs() << "Can't demangle: " << MangledSpecialization << '\n';
       abort();
@@ -83,10 +83,12 @@ std::string GenericSpecializationMangler::mangle(GenericSignature *Sig) {
   }
 
   bool First = true;
-  for (auto ParamType : Sig->getSubstitutableParams()) {
-    appendType(Type(ParamType).subst(SubMap)->getCanonicalType());
-    appendListSeparator(First);
-  }
+  Sig->forEachParam([&](GenericTypeParamType *ParamType, bool Canonical) {
+    if (Canonical) {
+      appendType(Type(ParamType).subst(SubMap)->getCanonicalType());
+      appendListSeparator(First);
+    }
+  });
   assert(!First && "no generic substitutions");
 
   if (isInlined)
@@ -200,8 +202,11 @@ FunctionSignatureSpecializationMangler::mangleConstantProp(LiteralInst *LI) {
   switch (LI->getKind()) {
   default:
     llvm_unreachable("unknown literal");
+  case SILInstructionKind::PreviousDynamicFunctionRefInst:
+  case SILInstructionKind::DynamicFunctionRefInst:
   case SILInstructionKind::FunctionRefInst: {
-    SILFunction *F = cast<FunctionRefInst>(LI)->getReferencedFunction();
+    SILFunction *F =
+        cast<FunctionRefBaseInst>(LI)->getInitiallyReferencedFunction();
     ArgOpBuffer << 'f';
     appendIdentifier(F->getName());
     break;
@@ -236,6 +241,7 @@ FunctionSignatureSpecializationMangler::mangleConstantProp(LiteralInst *LI) {
 
     ArgOpBuffer << 's';
     switch (SLI->getEncoding()) {
+      case StringLiteralInst::Encoding::Bytes: ArgOpBuffer << 'B'; break;
       case StringLiteralInst::Encoding::UTF8: ArgOpBuffer << 'b'; break;
       case StringLiteralInst::Encoding::UTF16: ArgOpBuffer << 'w'; break;
       case StringLiteralInst::Encoding::ObjCSelector: ArgOpBuffer << 'c'; break;
@@ -255,12 +261,12 @@ FunctionSignatureSpecializationMangler::mangleClosureProp(SILInstruction *Inst) 
   // restriction is removed, the assert here will fire.
   if (auto *TTTFI = dyn_cast<ThinToThickFunctionInst>(Inst)) {
     auto *FRI = cast<FunctionRefInst>(TTTFI->getCallee());
-    appendIdentifier(FRI->getReferencedFunction()->getName());
+    appendIdentifier(FRI->getInitiallyReferencedFunction()->getName());
     return;
   }
   auto *PAI = cast<PartialApplyInst>(Inst);
   auto *FRI = cast<FunctionRefInst>(PAI->getCallee());
-  appendIdentifier(FRI->getReferencedFunction()->getName());
+  appendIdentifier(FRI->getInitiallyReferencedFunction()->getName());
 
   // Then we mangle the types of the arguments that the partial apply is
   // specializing.

@@ -60,14 +60,10 @@
 public protocol MutableCollection: Collection
 where SubSequence: MutableCollection
 {
-  // FIXME(ABI): Associated type inference requires this.
-  associatedtype Element
-
-  // FIXME(ABI): Associated type inference requires this.
-  associatedtype Index
-
-  // FIXME(ABI): Associated type inference requires this.
-  associatedtype SubSequence
+  // FIXME: Associated type inference requires these.
+  override associatedtype Element
+  override associatedtype Index
+  override associatedtype SubSequence
 
   /// Accesses the element at the specified position.
   ///
@@ -89,7 +85,8 @@ where SubSequence: MutableCollection
   ///   `endIndex` property.
   ///
   /// - Complexity: O(1)
-  subscript(position: Index) -> Element { get set }
+  @_borrowed
+  override subscript(position: Index) -> Element { get set }
 
   /// Accesses a contiguous subrange of the collection's elements.
   ///
@@ -115,7 +112,7 @@ where SubSequence: MutableCollection
   ///   the range must be valid indices of the collection.
   ///
   /// - Complexity: O(1)
-  subscript(bounds: Range<Index>) -> SubSequence { get set }
+  override subscript(bounds: Range<Index>) -> SubSequence { get set }
 
   /// Reorders the elements of the collection such that all the elements
   /// that match the given predicate are after all the elements that don't
@@ -183,12 +180,33 @@ where SubSequence: MutableCollection
   mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R?
+
+  /// Call `body(p)`, where `p` is a pointer to the collection's
+  /// mutable contiguous storage.  If no such storage exists, it is
+  /// first created.  If the collection does not support an internal
+  /// representation in a form of mutable contiguous storage, `body` is not
+  /// called and `nil` is returned.
+  ///
+  /// Often, the optimizer can eliminate bounds- and uniqueness-checks
+  /// within an algorithm, but when that fails, invoking the
+  /// same algorithm on `body`\ 's argument lets you trade safety for
+  /// speed.
+  mutating func withContiguousMutableStorageIfAvailable<R>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
+  ) rethrows -> R?
 }
 
 // TODO: swift-3-indexing-model - review the following
 extension MutableCollection {
   @inlinable
   public mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
+  ) rethrows -> R? {
+    return nil
+  }
+
+  @inlinable
+  public mutating func withContiguousMutableStorageIfAvailable<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R? {
     return nil

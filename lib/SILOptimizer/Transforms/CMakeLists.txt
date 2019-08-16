@@ -1,6 +1,8 @@
 silopt_register_sources(
   ARCCodeMotion.cpp
+  AccessEnforcementDom.cpp
   AccessEnforcementOpts.cpp
+  AccessEnforcementReleaseSinking.cpp 
   AccessEnforcementWMO.cpp
   AllocBoxToStack.cpp
   ArrayCountPropagation.cpp
@@ -9,13 +11,13 @@ silopt_register_sources(
   CSE.cpp
   ConditionForwarding.cpp
   CopyForwarding.cpp
+  CopyPropagation.cpp
   DeadCodeElimination.cpp
   DeadObjectElimination.cpp
   DeadStoreElimination.cpp
   Devirtualizer.cpp
   GenericSpecializer.cpp
   MergeCondFail.cpp
-  MarkUninitializedFixup.cpp
   Outliner.cpp
   ObjectOutliner.cpp
   OwnershipModelEliminator.cpp
@@ -23,13 +25,13 @@ silopt_register_sources(
   RedundantLoadElimination.cpp
   RedundantOverflowCheckRemoval.cpp
   ReleaseDevirtualizer.cpp
-  RemovePin.cpp
   SILCodeMotion.cpp
   SILLowerAggregateInstrs.cpp
   SILMem2Reg.cpp
   SILSROA.cpp
   SimplifyCFG.cpp
   Sink.cpp
+  SpecializeOpaqueArchetypes.cpp
   SpeculativeDevirtualizer.cpp
   StackPromotion.cpp
   UnsafeGuaranteedPeephole.cpp

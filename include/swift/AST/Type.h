@@ -38,7 +38,6 @@ class ClassDecl;
 class CanType;
 class EnumDecl;
 class GenericSignature;
-class LazyResolver;
 class ModuleDecl;
 class NominalTypeDecl;
 class GenericTypeDecl;
@@ -53,8 +52,9 @@ class TypeBase;
 class Type;
 class TypeWalker;
 struct ExistentialLayout;
-
-/// \brief Type substitution mapping from substitutable types to their
+enum class ResilienceExpansion : unsigned;
+  
+/// Type substitution mapping from substitutable types to their
 /// replacements.
 typedef llvm::DenseMap<SubstitutableType *, Type> TypeSubstitutionMap;
 
@@ -147,6 +147,8 @@ enum class SubstFlags {
   AllowLoweredTypes = 0x02,
   /// Map member types to their desugared witness type.
   DesugarMemberTypes = 0x04,
+  /// Substitute types involving opaque type archetypes.
+  SubstituteOpaqueArchetypes = 0x08,
 };
 
 /// Options for performing substitutions into a type.
@@ -312,7 +314,7 @@ public:
 
   /// Replace references to substitutable types with error types.
   Type substDependentTypesWithErrorTypes() const;
-
+  
   bool isPrivateStdlibType(bool treatNonBuiltinProtocolsAsPublic = true) const;
 
   void dump() const;
@@ -372,7 +374,8 @@ private:
 class CanType : public Type {
   bool isActuallyCanonicalOrNull() const;
 
-  static bool isReferenceTypeImpl(CanType type, bool functionsCount);
+  static bool isReferenceTypeImpl(CanType type, GenericSignature *sig,
+                                  bool functionsCount);
   static bool isExistentialTypeImpl(CanType type);
   static bool isAnyExistentialTypeImpl(CanType type);
   static bool isObjCExistentialTypeImpl(CanType type);
@@ -406,8 +409,26 @@ public:
   // Provide a few optimized accessors that are really type-class queries.
 
   /// Do values of this type have reference semantics?
+  ///
+  /// This includes isAnyClassReferenceType(), as well as function types.
   bool hasReferenceSemantics() const {
-    return isReferenceTypeImpl(*this, /*functions count*/ true);
+    return isReferenceTypeImpl(*this,
+                               /*signature*/ nullptr,
+                               /*functions count*/ true);
+  }
+
+  /// Are variables of this type permitted to have
+  /// ownership attributes?
+  ///
+  /// This includes:
+  ///   - class types, generic or not
+  ///   - archetypes with class or class protocol bounds
+  ///   - existentials with class or class protocol bounds
+  /// But not:
+  ///   - function types
+  bool allowsOwnership(GenericSignature *sig) const {
+    return isReferenceTypeImpl(*this, sig,
+                               /*functions count*/ false);
   }
 
   /// Are values of this type essentially just class references,
@@ -417,10 +438,13 @@ public:
   ///   - a class type
   ///   - a bound generic class type
   ///   - a class-bounded archetype type
+  ///   - a class-bounded type parameter
   ///   - a class-bounded existential type
   ///   - a dynamic Self type
   bool isAnyClassReferenceType() const {
-    return isReferenceTypeImpl(*this, /*functions count*/ false);
+    return isReferenceTypeImpl(*this,
+                               /*signature*/ nullptr,
+                               /*functions count*/ false);
   }
 
   /// Is this type existential?
@@ -592,6 +616,10 @@ public:
   GenericSignature *getPointer() const {
     return Signature;
   }
+
+  bool operator==(const swift::CanGenericSignature& other) {
+    return Signature == other.Signature;
+  }
 };
 
 template <typename T>
@@ -605,7 +633,6 @@ inline T *staticCastHelper(const Type &Ty) {
 template <typename T>
 using TypeArrayView = ArrayRefView<Type, T*, staticCastHelper,
                                    /*AllowOrigAccess*/true>;
-
 } // end namespace swift
 
 namespace llvm {
@@ -643,7 +670,8 @@ namespace llvm {
   template<> struct DenseMapInfo<swift::CanType>
     : public DenseMapInfo<swift::Type> {
     static swift::CanType getEmptyKey() {
-      return swift::CanType(nullptr);
+      return swift::CanType(llvm::DenseMapInfo<swift::
+                              TypeBase*>::getEmptyKey());
     }
     static swift::CanType getTombstoneKey() {
       return swift::CanType(llvm::DenseMapInfo<swift::

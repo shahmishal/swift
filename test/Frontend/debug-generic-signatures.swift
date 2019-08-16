@@ -76,7 +76,7 @@ struct Generic<T> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=Generic<T>
 // CHECK-NEXT: (normal_conformance type=Generic<T> protocol=P1
 // CHECK-NEXT:   (assoc_type req=A type=T)
-// CHECK-NEXT:   (value req=f() witness=main.(file).Generic.f()@{{.*}})
+// CHECK-NEXT:   (value req=f() witness=main.(file).Generic extension.f()@{{.*}})
 // CHECK-NEXT:   conforms_to: T P1)
 extension Generic: P1 where T: P1 {
     typealias A = T
@@ -118,8 +118,7 @@ extension Super: P2 where T: P2, U: P2 {
 // CHECK-NEXT:              (normal_conformance type=Recur protocol=P2 (details printed above))))
 // CHECK-NEXT:         (conformance type=U
 // CHECK-NEXT:            (normal_conformance type=Recur protocol=P2 (details printed above))))
-// CHECK-NEXT:     conforms_to: NonRecur P2
-// CHECK-NEXT:     conforms_to: Recur P2
+// CHECK-NEXT:     (conditional requirements unable to be computed)
 // CHECK-NEXT:     (normal_conformance type=Super<T, U> protocol=P2
 // CHECK-NEXT:       (assoc_type req=A type=T)
 // CHECK-NEXT:       (assoc_type req=B type=T)

@@ -12,6 +12,7 @@
 
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/Subsystems.h"
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
@@ -40,50 +41,74 @@ TypeLoc &InheritedDeclsReferencedRequest::getTypeLoc(
   return decl.get<ExtensionDecl *>()->getInherited()[index];
 }
 
-void InheritedDeclsReferencedRequest::diagnoseCycle(
-                                              DiagnosticEngine &diags) const {
+SourceLoc InheritedDeclsReferencedRequest::getNearestLoc() const {
   const auto &storage = getStorage();
   auto &typeLoc = getTypeLoc(std::get<0>(storage), std::get<1>(storage));
-  diags.diagnose(typeLoc.getLoc(), diag::circular_reference);
-}
-
-void InheritedDeclsReferencedRequest::noteCycleStep(
-                                                DiagnosticEngine &diags) const {
-  const auto &storage = getStorage();
-  auto &typeLoc = getTypeLoc(std::get<0>(storage), std::get<1>(storage));
-  diags.diagnose(typeLoc.getLoc(), diag::circular_reference_through);
-}
-
-//----------------------------------------------------------------------------//
-// Referenced underlying type declarations computation.
-//----------------------------------------------------------------------------//
-void UnderlyingTypeDeclsReferencedRequest::diagnoseCycle(
-                                               DiagnosticEngine &diags) const {
-  // FIXME: Improve this diagnostic.
-  auto subjectDecl = std::get<0>(getStorage());
-  diags.diagnose(subjectDecl, diag::circular_reference);
-}
-
-void UnderlyingTypeDeclsReferencedRequest::noteCycleStep(
-                                               DiagnosticEngine &diags) const {
-  auto subjectDecl = std::get<0>(getStorage());
-  // FIXME: Customize this further.
-  diags.diagnose(subjectDecl, diag::circular_reference_through);
+  return typeLoc.getLoc();
 }
 
 //----------------------------------------------------------------------------//
 // Superclass declaration computation.
 //----------------------------------------------------------------------------//
-void SuperclassDeclRequest::diagnoseCycle(DiagnosticEngine &diags) const {
-  // FIXME: Improve this diagnostic.
-  auto subjectDecl = std::get<0>(getStorage());
-  diags.diagnose(subjectDecl, diag::circular_reference);
+Optional<ClassDecl *> SuperclassDeclRequest::getCachedResult() const {
+  auto nominalDecl = std::get<0>(getStorage());
+
+  if (auto *classDecl = dyn_cast<ClassDecl>(nominalDecl))
+    if (classDecl->LazySemanticInfo.SuperclassDecl.getInt())
+      return classDecl->LazySemanticInfo.SuperclassDecl.getPointer();
+
+  if (auto *protocolDecl = dyn_cast<ProtocolDecl>(nominalDecl))
+    if (protocolDecl->LazySemanticInfo.SuperclassDecl.getInt())
+      return protocolDecl->LazySemanticInfo.SuperclassDecl.getPointer();
+
+  return None;
 }
 
-void SuperclassDeclRequest::noteCycleStep(DiagnosticEngine &diags) const {
-  auto subjectDecl = std::get<0>(getStorage());
-  // FIXME: Customize this further.
-  diags.diagnose(subjectDecl, diag::circular_reference_through);
+void SuperclassDeclRequest::cacheResult(ClassDecl *value) const {
+  auto nominalDecl = std::get<0>(getStorage());
+
+  if (auto *classDecl = dyn_cast<ClassDecl>(nominalDecl))
+    classDecl->LazySemanticInfo.SuperclassDecl.setPointerAndInt(value, true);
+
+  if (auto *protocolDecl = dyn_cast<ProtocolDecl>(nominalDecl))
+    protocolDecl->LazySemanticInfo.SuperclassDecl.setPointerAndInt(value, true);
+}
+
+//----------------------------------------------------------------------------//
+// Extended nominal computation.
+//----------------------------------------------------------------------------//
+Optional<NominalTypeDecl *> ExtendedNominalRequest::getCachedResult() const {
+  // Note: if we fail to compute any nominal declaration, it's considered
+  // a cache miss. This allows us to recompute the extended nominal types
+  // during extension binding.
+  auto ext = std::get<0>(getStorage());
+  if (ext->ExtendedNominal)
+    return ext->ExtendedNominal;
+
+  return None;
+}
+
+void ExtendedNominalRequest::cacheResult(NominalTypeDecl *value) const {
+  auto ext = std::get<0>(getStorage());
+  if (value)
+    ext->ExtendedNominal = value;
+}
+
+//----------------------------------------------------------------------------//
+// Destructor computation.
+//----------------------------------------------------------------------------//
+Optional<DestructorDecl *> GetDestructorRequest::getCachedResult() const {
+  auto *classDecl = std::get<0>(getStorage());
+  auto results = classDecl->lookupDirect(DeclBaseName::createDestructor());
+  if (results.empty())
+    return None;
+
+  return cast<DestructorDecl>(results.front());
+}
+
+void GetDestructorRequest::cacheResult(DestructorDecl *value) const {
+  auto *classDecl = std::get<0>(getStorage());
+  classDecl->addMember(value);
 }
 
 // Define request evaluation functions for each of the name lookup requests.

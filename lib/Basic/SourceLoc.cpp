@@ -302,15 +302,18 @@ void CharSourceRange::print(raw_ostream &OS, const SourceManager &SM,
     return;
 
   if (PrintText) {
-    OS << " RangeText=\""
-       << StringRef(Start.Value.getPointer(),
-                    getEnd().Value.getPointer() - Start.Value.getPointer() + 1)
-       << '"';
+    OS << " RangeText=\"" << SM.extractText(*this) << '"';
   }
 }
 
 void CharSourceRange::dump(const SourceManager &SM) const {
   print(llvm::errs(), SM);
+}
+
+llvm::Optional<unsigned>
+SourceManager::resolveOffsetForEndOfLine(unsigned BufferId,
+                                         unsigned Line) const {
+  return resolveFromLineCol(BufferId, Line, ~0u);
 }
 
 llvm::Optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
@@ -319,15 +322,15 @@ llvm::Optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
   if (Line == 0 || Col == 0) {
     return None;
   }
+  const bool LineEnd = Col == ~0u;
   auto InputBuf = getLLVMSourceMgr().getMemoryBuffer(BufferId);
   const char *Ptr = InputBuf->getBufferStart();
   const char *End = InputBuf->getBufferEnd();
   const char *LineStart = Ptr;
-  for (; Ptr < End; ++Ptr) {
+  --Line;
+  for (; Line && (Ptr < End); ++Ptr) {
     if (*Ptr == '\n') {
       --Line;
-      if (Line == 0)
-        break;
       LineStart = Ptr+1;
     }
   }
@@ -335,12 +338,18 @@ llvm::Optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
     return None;
   }
   Ptr = LineStart;
-  for (; Ptr < End; ++Ptr) {
+  // The <= here is to allow for non-inclusive range end positions at EOF
+  for (; ; ++Ptr) {
     --Col;
     if (Col == 0)
       return Ptr - InputBuf->getBufferStart();
-    if (*Ptr == '\n')
-      break;
+    if (*Ptr == '\n' || Ptr == End) {
+      if (LineEnd) {
+        return Ptr - InputBuf->getBufferStart();
+      } else {
+        break;
+      }
+    }
   }
   return None;
 }

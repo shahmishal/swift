@@ -17,6 +17,7 @@
 #include "swift/Parse/Parser.h"
 
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/DiagnosticSuppression.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Version.h"
@@ -36,7 +37,7 @@ namespace {
 /// Get PlatformConditionKind from platform condition name.
 static
 Optional<PlatformConditionKind> getPlatformConditionKind(StringRef Name) {
-  return llvm::StringSwitch<llvm::Optional<PlatformConditionKind>>(Name)
+  return llvm::StringSwitch<Optional<PlatformConditionKind>>(Name)
     .Case("os", PlatformConditionKind::OS)
     .Case("arch", PlatformConditionKind::Arch)
     .Case("_endian", PlatformConditionKind::Endianness)
@@ -53,6 +54,20 @@ static StringRef extractExprSource(SourceManager &SM, Expr *E) {
   return SM.extractText(Range);
 }
 
+static bool isValidPrefixUnaryOperator(Optional<StringRef> UnaryOperator) {
+  return UnaryOperator != None &&
+         (UnaryOperator.getValue() == ">=" || UnaryOperator.getValue() == "<");
+}
+
+static bool isValidVersion(const version::Version &Version,
+                           const version::Version &ExpectedVersion,
+                           StringRef UnaryOperator) {
+  if (UnaryOperator == ">=")
+    return Version >= ExpectedVersion;
+  if (UnaryOperator == "<")
+    return Version < ExpectedVersion;
+  llvm_unreachable("unsupported unary operator");
+}
 
 /// The condition validator.
 class ValidateIfConfigCondition :
@@ -63,7 +78,7 @@ class ValidateIfConfigCondition :
   bool HasError;
 
   /// Get the identifier string of the UnresolvedDeclRefExpr.
-  llvm::Optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
+  Optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
     auto UDRE = dyn_cast<UnresolvedDeclRefExpr>(E);
     if (!UDRE ||
         !UDRE->hasName() ||
@@ -85,7 +100,7 @@ class ValidateIfConfigCondition :
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
 
-    auto getNextOperator = [&]() -> llvm::Optional<StringRef> {
+    auto getNextOperator = [&]() -> Optional<StringRef> {
       assert((S.size() & 1) == 0);
       while (!S.empty()) {
         auto Name = getDeclRefStr(S[0], DeclRefKind::BinaryOperator);
@@ -109,7 +124,7 @@ class ValidateIfConfigCondition :
       // If failed, it's not a sequence anymore.
       return LHS;
     Expr *Op = S[0];
-  
+
     // We will definitely be consuming at least one operator.
     // Pull out the prospective RHS and slice off the first two elements.
     Expr *RHS = validate(S[1]);
@@ -216,16 +231,16 @@ public:
       return E;
     }
 
-    // 'swift' '(' '>=' float-literal ( '.' integer-literal )* ')'
-    // 'compiler' '(' '>=' float-literal ( '.' integer-literal )* ')'
+    // 'swift' '(' ('>=' | '<') float-literal ( '.' integer-literal )* ')'
+    // 'compiler' '(' ('>=' | '<') float-literal ( '.' integer-literal )* ')'
     if (*KindName == "swift" || *KindName == "compiler") {
       auto PUE = dyn_cast<PrefixUnaryExpr>(Arg);
-      llvm::Optional<StringRef> PrefixName = PUE ?
-        getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator) : None;
-      if (!PrefixName || *PrefixName != ">=") {
-        D.diagnose(Arg->getLoc(),
-                   diag::unsupported_platform_condition_argument,
-                   "a unary comparison, such as '>=2.2'");
+      Optional<StringRef> PrefixName =
+          PUE ? getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator) : None;
+      if (!isValidPrefixUnaryOperator(PrefixName)) {
+        D.diagnose(
+            Arg->getLoc(), diag::unsupported_platform_condition_argument,
+            "a unary comparison '>=' or '<'; for example, '>=2.2' or '<2.2'");
         return nullptr;
       }
       auto versionString = extractExprSource(Ctx.SourceMgr, PUE->getArg());
@@ -382,13 +397,17 @@ public:
       return thisVersion >= Val;
     } else if ((KindName == "swift") || (KindName == "compiler")) {
       auto PUE = cast<PrefixUnaryExpr>(Arg);
+      auto PrefixName = getDeclRefStr(PUE->getFn());
       auto Str = extractExprSource(Ctx.SourceMgr, PUE->getArg());
       auto Val = version::Version::parseVersionString(
           Str, SourceLoc(), nullptr).getValue();
       if (KindName == "swift") {
-        return Ctx.LangOpts.EffectiveLanguageVersion >= Val;  
+        return isValidVersion(Ctx.LangOpts.EffectiveLanguageVersion, Val,
+                              PrefixName);
       } else if (KindName == "compiler") {
-        return version::Version::getCurrentLanguageVersion() >= Val;
+        auto currentLanguageVersion =
+            version::Version::getCurrentLanguageVersion();
+        return isValidVersion(currentLanguageVersion, Val, PrefixName);
       } else {
         llvm_unreachable("unsupported version conditional");
       }
@@ -565,6 +584,12 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
   Parser::StructureMarkerRAII ParsingDecl(
       *this, Tok.getLoc(), Parser::StructureMarkerKind::IfConfig);
 
+  bool shouldEvaluate =
+      // Don't evaluate if it's in '-parse' mode, etc.
+      State->PerformConditionEvaluation &&
+      // If it's in inactive #if ... #endif block, there's no point to do it.
+      !getScopeInfo().isInactiveConfigBlock();
+
   bool foundActive = false;
   bool isVersionCondition = false;
   while (1) {
@@ -576,15 +601,23 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     Expr *Condition = nullptr;
     bool isActive = false;
 
+    if (!Tok.isAtStartOfLine() && isElse && Tok.is(tok::kw_if)) {
+      diagnose(Tok, diag::unexpected_if_following_else_compilation_directive)
+          .fixItReplace(SourceRange(ClauseLoc, consumeToken()), "#elseif");
+      isElse = false;
+    }
+
     // Parse the condition.  Evaluate it to determine the active
     // clause unless we're doing a parse-only pass.
     if (isElse) {
-      isActive = !foundActive && State->PerformConditionEvaluation;
+      isActive = !foundActive && shouldEvaluate;
     } else {
       llvm::SaveAndRestore<bool> S(InPoundIfEnvironment, true);
       ParserResult<Expr> Result = parseExprSequence(diag::expected_expr,
                                                       /*isBasic*/true,
                                                       /*isForDirective*/true);
+      if (Result.hasCodeCompletion())
+        return makeParserCodeCompletionStatus();
       if (Result.isNull())
         return makeParserError();
       Condition = Result.get();
@@ -592,7 +625,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
         // Error in the condition;
         isActive = false;
         isVersionCondition = false;
-      } else if (!foundActive && State->PerformConditionEvaluation) {
+      } else if (!foundActive && shouldEvaluate) {
         // Evaluate the condition only if we haven't found any active one and
         // we're not in parse-only mode.
         isActive = evaluateIfConfigCondition(Condition, Context);
@@ -619,9 +652,10 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     if (isActive || !isVersionCondition) {
       parseElements(Elements, isActive);
     } else {
-      DiagnosticTransaction DT(Diags);
-      skipUntilConditionalBlockClose();
-      DT.abort();
+      // The parser will keep running and we just discard the AST part.
+      DiagnosticSuppression suppression(Context.Diags);
+      SmallVector<ASTNode, 16> dropedElements;
+      parseElements(dropedElements, false);
     }
 
     Clauses.emplace_back(ClauseLoc, Condition,

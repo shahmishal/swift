@@ -70,13 +70,14 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-rr-code-motion"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/EscapeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
-#include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProgramTerminationAnalysis.h"
+#include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFG.h"
@@ -96,10 +97,6 @@ STATISTIC(NumReleasesHoisted, "Number of releases hoisted");
 
 llvm::cl::opt<bool> DisableARCCodeMotion("disable-arc-cm", llvm::cl::init(false));
 
-/// Disable optimization if we have to break critical edges in the function.
-llvm::cl::opt<bool>
-DisableIfWithCriticalEdge("disable-with-critical-edge", llvm::cl::init(false));
-
 //===----------------------------------------------------------------------===//
 //                             Block State 
 //===----------------------------------------------------------------------===//
@@ -111,21 +108,21 @@ struct BlockState {
   /// NOTE: we could do the data flow with BBSetIn or BBSetOut, but that would
   /// require us to create a temporary copy to check whether the BBSet has
   /// changed after the genset and killset has been applied.
-  llvm::SmallBitVector BBSetIn;
+  SmallBitVector BBSetIn;
 
   /// A bit vector for which the ith bit represents the ith refcounted root in
   /// RCRootVault.
-  llvm::SmallBitVector BBSetOut;
+  SmallBitVector BBSetOut;
 
   /// A bit vector for which the ith bit represents the ith refcounted root in
   /// RCRootVault. If the bit is set, that means this basic block creates a
   /// retain which can be sunk or a release which can be hoisted.
-  llvm::SmallBitVector BBGenSet;
+  SmallBitVector BBGenSet;
 
   /// A bit vector for which the ith bit represents the ith refcounted root in
   /// RCRootVault. If this bit is set, that means this basic block stops retain
   /// or release of the refcounted root to be moved across.
-  llvm::SmallBitVector BBKillSet;
+  SmallBitVector BBKillSet;
 
   /// A bit vector for which the ith bit represents the ith refcounted root in
   /// RCRootVault. If this bit is set, that means this is potentially a retain
@@ -134,7 +131,7 @@ struct BlockState {
   ///
   /// NOTE: this vector contains an approximation of whether there will be a
   /// retain or release to a certain point of a basic block.
-  llvm::SmallBitVector BBMaxSet;
+  SmallBitVector BBMaxSet;
 };
 
 /// CodeMotionContext - This is the base class which retain code motion and
@@ -182,6 +179,12 @@ protected:
   /// process the block again in the last iteration. We populate this set when
   /// we compute the genset and killset.
   llvm::SmallPtrSet<SILBasicBlock *, 8> InterestBlocks;
+
+#ifndef NDEBUG
+  // SILPrintContext is used to print block IDs in RPO order.
+  // It is optional so only the final insertion point interference is printed.
+  Optional<SILPrintContext> printCtx;
+#endif
 
   /// Return the rc-identity root of the SILValue.
   SILValue getRCRoot(SILValue R) {
@@ -271,7 +274,7 @@ class RetainBlockState : public BlockState {
 public:
   /// Check whether the BBSetOut has changed. If it does, we need to rerun
   /// the data flow on this block's successors to reach fixed point.
-  bool updateBBSetOut(llvm::SmallBitVector &X) {
+  bool updateBBSetOut(SmallBitVector &X) {
     if (BBSetOut == X)
       return false;
     BBSetOut = X;
@@ -306,18 +309,28 @@ class RetainCodeMotionContext : public CodeMotionContext {
     // end, this function is called many times.
     //
     // These terminator instructions block.
-    if (isa<ReturnInst>(II) || isa<ThrowInst>(II) || isa<UnreachableInst>(II))
+    if (isa<ReturnInst>(II) || isa<ThrowInst>(II) || isa<UnwindInst>(II) ||
+        isa<UnreachableInst>(II))
       return true;
     // Identical RC root blocks code motion, we will be able to move this retain
     // further once we move the blocking retain.
-    if (isRetainInstruction(II) && getRCRoot(II) == Ptr)
+    if (isRetainInstruction(II) && getRCRoot(II) == Ptr) {
+      LLVM_DEBUG(if (printCtx) llvm::dbgs()
+                 << "Retain " << Ptr << "  at matching retain " << *II);
       return true;
+    }
     // Ref count checks do not have side effects, but are barriers for retains.
-    if (mayCheckRefCount(II))
+    if (mayCheckRefCount(II)) {
+      LLVM_DEBUG(if (printCtx) llvm::dbgs()
+                 << "Retain " << Ptr << "  at refcount check " << *II);
       return true;
+    }
     // mayDecrement reference count stops code motion.
-    if (mayDecrementRefCount(II, Ptr, AA)) 
+    if (mayDecrementRefCount(II, Ptr, AA)) {
+      LLVM_DEBUG(if (printCtx) llvm::dbgs()
+                 << "Retain " << Ptr << "  at may decrement " << *II);
       return true;
+    }
     // This instruction does not block the retain code motion.
     return false;
   }
@@ -400,6 +413,8 @@ void RetainCodeMotionContext::initializeCodeMotionDataFlow() {
         continue;
       RCRootIndex[Root] = RCRootVault.size();
       RCRootVault.insert(Root);
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Retain Root #" << RCRootVault.size() << " " << Root);
     }
   }
 
@@ -562,6 +577,9 @@ void RetainCodeMotionContext::convergeCodeMotionDataFlow() {
 }
 
 void RetainCodeMotionContext::computeCodeMotionInsertPoints() {
+#ifndef NDEBUG
+  printCtx.emplace(llvm::dbgs(), /*Verbose=*/false, /*Sorted=*/true);
+#endif
   // The BBSetOuts have converged, run last iteration and figure out
   // insertion point for each refcounted root.
   for (SILBasicBlock *BB : PO->getReversePostOrder()) {
@@ -622,7 +640,7 @@ class ReleaseBlockState : public BlockState {
 public:
   /// Check whether the BBSetIn has changed. If it does, we need to rerun
   /// the data flow on this block's predecessors to reach fixed point.
-  bool updateBBSetIn(llvm::SmallBitVector &X) {
+  bool updateBBSetIn(SmallBitVector &X) {
     if (BBSetIn == X)
       return false;
     BBSetIn = X;
@@ -669,11 +687,17 @@ class ReleaseCodeMotionContext : public CodeMotionContext {
       return true;
     // Identical RC root blocks code motion, we will be able to move this release
     // further once we move the blocking release.
-    if (isReleaseInstruction(II) && getRCRoot(II) == Ptr)
+    if (isReleaseInstruction(II) && getRCRoot(II) == Ptr) {
+      LLVM_DEBUG(if (printCtx) llvm::dbgs()
+                 << "Release " << Ptr << "  at matching release " << *II);
       return true;
+    }
     // Stop at may interfere.
-    if (mayHaveSymmetricInterference(II, Ptr, AA))
+    if (mayHaveSymmetricInterference(II, Ptr, AA)) {
+      LLVM_DEBUG(if (printCtx) llvm::dbgs()
+                 << "Release " << Ptr << "  at interference " << *II);
       return true;
+    }
     // This instruction does not block the release.
     return false;
   }
@@ -773,6 +797,8 @@ void ReleaseCodeMotionContext::initializeCodeMotionDataFlow() {
         continue;
       RCRootIndex[Root] = RCRootVault.size();
       RCRootVault.insert(Root);
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Release Root #" << RCRootVault.size() << " " << Root);
     }
     if (MultiIteration && BB.getTerminator()->isFunctionExiting())
       Worklist.push_back(&BB);
@@ -974,6 +1000,10 @@ void ReleaseCodeMotionContext::convergeCodeMotionDataFlow() {
 }
 
 void ReleaseCodeMotionContext::computeCodeMotionInsertPoints() {
+#ifndef NDEBUG
+  printCtx.emplace(llvm::dbgs(), /*Verbose=*/false, /*Sorted=*/true);
+#endif
+
   // The BBSetIns have converged, run last iteration and figure out insertion
   // point for each RC root.
   for (SILBasicBlock *BB : PO->getPostOrder()) {
@@ -993,6 +1023,9 @@ void ReleaseCodeMotionContext::computeCodeMotionInsertPoints() {
         if (!SBB->BBSetIn[i])
           continue;
         InsertPoints[RCRootVault[i]].push_back(&*(*Succ).begin());
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Release partial merge. Insert at successor: "
+                   << printCtx->getID(BB) << " " << RCRootVault[i]);
       }
     }
 
@@ -1012,6 +1045,9 @@ void ReleaseCodeMotionContext::computeCodeMotionInsertPoints() {
         if (!SBB->BBSetIn[i])
           continue;
         InsertPoints[RCRootVault[i]].push_back(&*(*Succ).begin());
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Release terminator use. Insert at successor: "
+                   << printCtx->getID(BB) << " " << RCRootVault[i]);
       }
       S->BBSetOut.reset(i);
     }
@@ -1075,9 +1111,7 @@ static void eliminateRetainsPrecedingProgramTerminationPoints(SILFunction *f) {
     // such a case, we can ignore it. All other functions though imply we must
     // bail. If we don't have a function here, check for side
     if (auto apply = FullApplySite::isa(&*iter)) {
-      SILFunction *callee = apply.getCalleeFunction();
-      if (!callee ||
-          !callee->hasSemanticsAttr(SEMANTICS_ARC_PROGRAMTERMINATION_POINT)) {
+      if (!apply.isCalleeKnownProgramTerminationPoint()) {
         continue;
       }
     } else {
@@ -1155,9 +1189,8 @@ public:
     if (!F->shouldOptimize())
       return;
 
-    // Return if there is critical edge and we are disabling critical edge
-    // splitting.
-    if (DisableIfWithCriticalEdge && hasCriticalEdges(*F, false))
+    // FIXME: Support ownership.
+    if (F->hasOwnership())
       return;
 
     LLVM_DEBUG(llvm::dbgs() << "*** ARCCM on function: " << F->getName()
@@ -1169,7 +1202,7 @@ public:
     //
     // TODO: maybe we can do this lazily or maybe we should disallow SIL passes
     // to create critical edges.
-    bool EdgeChanged = splitAllCriticalEdges(*F, false, nullptr, nullptr);
+    bool EdgeChanged = splitAllCriticalEdges(*F, nullptr, nullptr);
     if (EdgeChanged)
       POA->invalidateFunction(F);
 

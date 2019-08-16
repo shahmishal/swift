@@ -427,6 +427,8 @@ protocol ProtRoot {
 
 protocol ProtDerived : ProtRoot {
   func fooCommon()
+  // CHECK: [[@LINE-1]]:8 | instance-method/Swift | fooCommon() | s:14swift_ide_test11ProtDerivedP9fooCommonyyF | Def,Dyn,RelChild,RelOver | rel: 2
+  
   func bar1()
   func bar2()
   func bar3(_ : Int)
@@ -435,9 +437,8 @@ protocol ProtDerived : ProtRoot {
 
 extension ProtDerived {
   func fooCommon() {}
-  // CHECK: [[@LINE-1]]:8 | instance-method/Swift | fooCommon() | s:14swift_ide_test11ProtDerivedPAAE9fooCommonyyF | Def,Dyn,RelChild,RelOver | rel: 3
+  // CHECK: [[@LINE-1]]:8 | instance-method/Swift | fooCommon() | s:14swift_ide_test11ProtDerivedPAAE9fooCommonyyF | Def,Dyn,RelChild,RelOver | rel: 2
   // CHECK-NEXT: RelOver | instance-method/Swift | fooCommon() | s:14swift_ide_test11ProtDerivedP9fooCommonyyF
-  // CHECK-NEXT: RelOver | instance-method/Swift | fooCommon() | s:14swift_ide_test8ProtRootP9fooCommonyyF
 
   func foo1() {}
   // CHECK: [[@LINE-1]]:8 | instance-method/Swift | foo1() | s:14swift_ide_test11ProtDerivedPAAE4foo1yyF | Def,Dyn,RelChild,RelOver | rel: 2
@@ -502,3 +503,15 @@ _ = \StructWithKeypath.[0]
 // CHECK: [[@LINE-1]]:24 | instance-property/subscript/Swift | subscript(_:) | s:14swift_ide_test17StructWithKeypathVyS2icip | Ref,Read | rel: 0
 // CHECK: [[@LINE-2]]:24 | instance-method/acc-get/Swift | getter:subscript(_:) | s:14swift_ide_test17StructWithKeypathVyS2icig | Ref,Call,Impl | rel: 0
 
+
+struct BStruct {
+  var x = 17
+  var y = true
+  var z = "hello"
+}
+
+func useDefaultInits() {
+  _ = BStruct(y: false)
+  // CHECK: [[@LINE-1]]:15 | instance-property/Swift | y | s:14swift_ide_test7BStructV1ySbvp | Ref,RelCont
+  // CHECK: [[@LINE-2]]:7 | constructor/Swift | init(x:y:z:) | s:14swift_ide_test7BStructV1x1y1zACSi_SbSStcfc | Ref,Call,RelCall,RelCont | rel: 1
+}

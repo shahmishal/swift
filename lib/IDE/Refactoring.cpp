@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/Refactoring.h"
+#include "swift/IDE/IDERequests.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
@@ -27,6 +28,7 @@
 #include "swift/Frontend/Frontend.h"
 #include "swift/Index/Index.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Subsystems.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/StringSet.h"
@@ -387,7 +389,7 @@ public:
 };
 
 class TextReplacementsRenamer : public Renamer {
-  llvm::StringMap<char> &ReplaceTextContext;
+  llvm::StringSet<> &ReplaceTextContext;
   std::vector<Replacement> Replacements;
 
 public:
@@ -395,7 +397,9 @@ public:
 
 private:
   StringRef registerText(StringRef Text) {
-    return ReplaceTextContext.insert({Text, char()}).first->getKey();
+    if (Text.empty())
+      return Text;
+    return ReplaceTextContext.insert(Text).first->getKey();
   }
 
   StringRef getCallArgLabelReplacement(StringRef OldLabelRange,
@@ -497,7 +501,7 @@ private:
 public:
   TextReplacementsRenamer(const SourceManager &SM, StringRef OldName,
                           StringRef NewName,
-                          llvm::StringMap<char> &ReplaceTextContext)
+                          llvm::StringSet<> &ReplaceTextContext)
       : Renamer(SM, OldName), ReplaceTextContext(ReplaceTextContext),
         New(NewName) {
     assert(Old.isValid() && New.isValid());
@@ -549,9 +553,7 @@ public:
 private:
   bool indexLocals() override { return true; }
   void failed(StringRef error) override {}
-  bool recordHash(StringRef hash, bool isKnown) override { return true; }
-  bool startDependency(StringRef name, StringRef path, bool isClangModule,
-                       bool isSystem, StringRef hash) override {
+  bool startDependency(StringRef name, StringRef path, bool isClangModule, bool isSystem) override {
     return true;
   }
   bool finishDependency(bool isClangModule) override { return true; }
@@ -688,12 +690,10 @@ public:
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {
-    // We can only proceed with valid location and source file.
-    if (StartLoc.isValid() && TheFile) {
-      // Resolve the sema token and save it for later use.
-      CursorInfoResolver Resolver(*TheFile);
-      CursorInfo = Resolver.resolve(StartLoc);
-    }
+  // Resolve the sema token and save it for later use.
+  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
+                          CursorInfoRequest{ CursorInfoOwner(TheFile, StartLoc)},
+                                 ResolvedCursorInfo());
   }
 };
 
@@ -713,7 +713,6 @@ class RefactoringAction##KIND: public TokenBasedRefactoringAction {           \
 #include "swift/IDE/RefactoringKinds.def"
 
 class RangeBasedRefactoringAction : public RefactoringAction {
-  RangeResolver Resolver;
 protected:
   ResolvedRangeInfo RangeInfo;
 public:
@@ -721,8 +720,9 @@ public:
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer),
-  Resolver(*TheFile, Opts.Range.getStart(SM), Opts.Range.getEnd(SM)),
-  RangeInfo(Resolver.resolve()) {}
+  RangeInfo(evaluateOrDefault(MD->getASTContext().evaluator,
+    RangeInfoRequest(RangeInfoOwner(TheFile, Opts.Range.getStart(SM), Opts.Range.getEnd(SM))),
+                              ResolvedRangeInfo())) {}
 };
 
 #define RANGE_REFACTORING(KIND, NAME, ID)                                     \
@@ -780,10 +780,11 @@ bool RefactoringActionLocalRename::performChange() {
                         MD->getNameStr());
     return true;
   }
-  CursorInfoResolver Resolver(*TheFile);
-  ResolvedCursorInfo CursorInfo = Resolver.resolve(StartLoc);
+  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
+                          CursorInfoRequest{CursorInfoOwner(TheFile, StartLoc)},
+                                 ResolvedCursorInfo());
   if (CursorInfo.isValid() && CursorInfo.ValueD) {
-    ValueDecl *VD = CursorInfo.ValueD;
+    ValueDecl *VD = CursorInfo.CtorTyRef ? CursorInfo.CtorTyRef : CursorInfo.ValueD;
     llvm::SmallVector<DeclContext *, 8> Scopes;
     analyzeRenameScope(VD, DiagEngine, Scopes);
     if (Scopes.empty())
@@ -933,6 +934,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
   switch (RangeInfo.RangeContext->getContextKind()) {
   case swift::DeclContextKind::Initializer:
   case swift::DeclContextKind::SubscriptDecl:
+  case swift::DeclContextKind::EnumElementDecl:
   case swift::DeclContextKind::AbstractFunctionDecl:
   case swift::DeclContextKind::AbstractClosureExpr:
   case swift::DeclContextKind::TopLevelCodeDecl:
@@ -963,6 +965,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
       success({CannotExtractReason::VoidType});
   }
   }
+  llvm_unreachable("unhandled kind");
 }
 
 static StringRef correctNameInternal(ASTContext &Ctx, StringRef Name,
@@ -1492,6 +1495,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 bool RefactoringActionExtractExpr::performChange() {
@@ -1514,6 +1518,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 bool RefactoringActionExtractRepeatedExpr::performChange() {
   return RefactoringActionExtractExprBase(TheFile, RangeInfo,
@@ -1573,6 +1578,7 @@ bool RefactoringActionMoveMembersToExtension::isApplicable(
   case RangeKind::Invalid:
     return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 bool RefactoringActionMoveMembersToExtension::performChange() {
@@ -1612,8 +1618,9 @@ class FindAllSubDecls : public SourceEntityWalker {
       return false;
 
     if (auto ASD = dyn_cast<AbstractStorageDecl>(D)) {
-      auto accessors = ASD->getAllAccessors();
-      Found.insert(accessors.begin(), accessors.end());
+      ASD->visitParsedAccessors([&](AccessorDecl *accessor) {
+        Found.insert(accessor);
+      });
     }
     return true;
   }
@@ -1643,6 +1650,7 @@ bool RefactoringActionReplaceBodiesWithFatalError::isApplicable(
   case RangeKind::Invalid:
     return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 bool RefactoringActionReplaceBodiesWithFatalError::performChange() {
@@ -1901,8 +1909,7 @@ public:
   IfExpr *getIf() {
     if (!Assign)
       return nullptr;
-
-    return dyn_cast<IfExpr>(Assign->getSrc());
+    return dyn_cast_or_null<IfExpr>(Assign->getSrc());
   }
 
   SourceRange getNameRange() {
@@ -2060,6 +2067,180 @@ bool RefactoringActionExpandTernaryExpr::performChange() {
   EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
 
   return false; //don't abort
+}
+
+bool RefactoringActionConvertIfLetExprToGuardExpr::
+  isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+
+  if (Info.Kind != RangeKind::SingleStatement
+      && Info.Kind != RangeKind::MultiStatement)
+    return false;
+
+  if (Info.ContainedNodes.empty())
+    return false;
+
+  IfStmt *If = nullptr;
+
+  if (Info.ContainedNodes.size() == 1) {
+    if (auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>()) {
+      If = dyn_cast<IfStmt>(S);
+    }
+  }
+
+  if (!If)
+    return false;
+
+  auto CondList = If->getCond();
+
+  if (CondList.size() == 1) {
+    auto E = CondList[0];
+    auto P = E.getKind();
+    if (P == swift::StmtConditionElement::CK_PatternBinding) {
+      auto Body = dyn_cast_or_null<BraceStmt>(If->getThenStmt());
+      if (Body)
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool RefactoringActionConvertIfLetExprToGuardExpr::performChange() {
+
+  auto S = RangeInfo.ContainedNodes[0].dyn_cast<Stmt*>();
+  IfStmt *If = dyn_cast<IfStmt>(S);
+  auto CondList = If->getCond();
+
+  // Get if-let condition
+  SourceRange range = CondList[0].getSourceRange();
+  SourceManager &SM = RangeInfo.RangeContext->getASTContext().SourceMgr;
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+  
+  auto Body = dyn_cast_or_null<BraceStmt>(If->getThenStmt());
+  
+  // Get if-let then body.
+  auto firstElement = Body->getElements()[0];
+  auto lastElement = Body->getElements().back();
+  SourceRange bodyRange = firstElement.getSourceRange();
+  bodyRange.widen(lastElement.getSourceRange());
+  auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, bodyRange);
+  
+  llvm::SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+  
+  llvm::StringRef Space = " ";
+  llvm::StringRef NewLine = "\n";
+  
+  OS << tok::kw_guard << Space;
+  OS << CondCharRange.str().str() << Space;
+  OS << tok::kw_else << Space;
+  OS << tok::l_brace << NewLine;
+  
+  // Get if-let else body.
+  if (auto *ElseBody = dyn_cast_or_null<BraceStmt>(If->getElseStmt())) {
+    auto firstElseElement = ElseBody->getElements()[0];
+    auto lastElseElement = ElseBody->getElements().back();
+    SourceRange elseBodyRange = firstElseElement.getSourceRange();
+    elseBodyRange.widen(lastElseElement.getSourceRange());
+    auto ElseBodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, elseBodyRange);
+    OS << ElseBodyCharRange.str().str() << NewLine;
+  }
+  
+  OS << tok::kw_return << NewLine;
+  OS << tok::r_brace << NewLine;
+  OS << BodyCharRange.str().str();
+  
+  // Replace if-let to guard
+  auto ReplaceRange = RangeInfo.ContentRange;
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+
+  return false;
+}
+
+bool RefactoringActionConvertGuardExprToIfLetExpr::
+  isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  if (Info.Kind != RangeKind::SingleStatement
+      && Info.Kind != RangeKind::MultiStatement)
+    return false;
+
+  if (Info.ContainedNodes.empty())
+    return false;
+
+  GuardStmt *guardStmt = nullptr;
+
+  if (Info.ContainedNodes.size() > 0) {
+    if (auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>()) {
+      guardStmt = dyn_cast<GuardStmt>(S);
+    }
+  }
+
+  if (!guardStmt)
+    return false;
+
+  auto CondList = guardStmt->getCond();
+
+  if (CondList.size() == 1) {
+    auto E = CondList[0];
+    auto P = E.getPatternOrNull();
+    if (P && E.getKind() == swift::StmtConditionElement::CK_PatternBinding)
+      return true;
+  }
+
+  return false;
+}
+
+bool RefactoringActionConvertGuardExprToIfLetExpr::performChange() {
+
+  // Get guard stmt
+  auto S = RangeInfo.ContainedNodes[0].dyn_cast<Stmt*>();
+  GuardStmt *Guard = dyn_cast<GuardStmt>(S);
+
+  // Get guard condition
+  auto CondList = Guard->getCond();
+
+  // Get guard condition source
+  SourceRange range = CondList[0].getSourceRange();
+  SourceManager &SM = RangeInfo.RangeContext->getASTContext().SourceMgr;
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+  
+  llvm::SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+  
+  llvm::StringRef Space = " ";
+  llvm::StringRef NewLine = "\n";
+  
+  OS << tok::kw_if << Space;
+  OS << CondCharRange.str().str() << Space;
+  OS << tok::l_brace << NewLine;
+
+  // Get nodes after guard to place them at if-let body
+  if (RangeInfo.ContainedNodes.size() > 1) {
+    auto S = RangeInfo.ContainedNodes[1].getSourceRange();
+    S.widen(RangeInfo.ContainedNodes.back().getSourceRange());
+    auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, S);
+    OS << BodyCharRange.str().str() << NewLine;
+  }
+  OS << tok::r_brace;
+
+  // Get guard body
+  auto Body = dyn_cast_or_null<BraceStmt>(Guard->getBody());
+  
+  if (Body && Body->getElements().size() > 1) {
+    auto firstElement = Body->getElements()[0];
+    auto lastElement = Body->getElements().back();
+    SourceRange bodyRange = firstElement.getSourceRange();
+    bodyRange.widen(lastElement.getSourceRange());
+    auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, bodyRange);
+    OS << Space << tok::kw_else << Space << tok::l_brace << NewLine;
+    OS << BodyCharRange.str().str() << NewLine;
+    OS << tok::r_brace;
+  }
+  
+  // Replace guard to if-let
+  auto ReplaceRange = RangeInfo.ContentRange;
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+  
+  return false;
 }
 
 /// Struct containing info about an IfStmt that can be converted into an IfExpr.
@@ -2334,7 +2515,7 @@ getUnsatisfiedRequirements(const DeclContext *DC) {
   for(ProtocolConformance *Con : DC->getLocalConformances()) {
 
     // Collect non-witnessed requirements.
-    Con->forEachNonWitnessedRequirement(DC->getASTContext().getLazyResolver(),
+    Con->forEachNonWitnessedRequirement(
       [&](ValueDecl *VD) { NonWitnessedReqs.push_back(VD); });
   }
 
@@ -2383,11 +2564,12 @@ collectAvailableRefactoringsAtCursor(SourceFile *SF, unsigned Line,
   DiagnosticEngine DiagEngine(SM);
   std::for_each(DiagConsumers.begin(), DiagConsumers.end(),
                 [&](DiagnosticConsumer *Con) { DiagEngine.addConsumer(*Con); });
-  CursorInfoResolver Resolver(*SF);
   SourceLoc Loc = SM.getLocForLineCol(SF->getBufferID().getValue(), Line, Column);
   if (Loc.isInvalid())
     return {};
-  ResolvedCursorInfo Tok = Resolver.resolve(Lexer::getLocForStartOfToken(SM, Loc));
+  ResolvedCursorInfo Tok = evaluateOrDefault(SF->getASTContext().evaluator,
+    CursorInfoRequest{CursorInfoOwner(SF, Lexer::getLocForStartOfToken(SM, Loc))},
+                                             ResolvedCursorInfo());
   return collectAvailableRefactorings(SF, Tok, Scratch, /*Exclude rename*/false);
 }
 
@@ -2849,8 +3031,6 @@ static CallExpr *findTrailingClosureTarget(SourceManager &SM,
   if (!Args)
     return nullptr;
   Expr *LastArg;
-  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
-    Args = TSE->getSubExpr();
   if (auto *PE = dyn_cast<ParenExpr>(Args)) {
     LastArg = PE->getSubExpr();
   } else {
@@ -2878,33 +3058,24 @@ bool RefactoringActionTrailingClosure::performChange() {
   auto *CE = findTrailingClosureTarget(SM, CursorInfo);
   if (!CE)
     return true;
-  Expr *Args = CE->getArg();
-  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
-    Args = TSE->getSubExpr();
+  Expr *Arg = CE->getArg();
 
   Expr *ClosureArg = nullptr;
   Expr *PrevArg = nullptr;
-  SourceLoc LPLoc, RPLoc;
 
-  if (auto *PE = dyn_cast<ParenExpr>(Args)) {
-    ClosureArg = PE->getSubExpr();
-    LPLoc = PE->getLParenLoc();
-    RPLoc = PE->getRParenLoc();
-  } else {
-    auto *TE = cast<TupleExpr>(Args);
-    auto NumArgs = TE->getNumElements();
-    if (NumArgs == 0)
-      return true;
-    LPLoc = TE->getLParenLoc();
-    RPLoc = TE->getRParenLoc();
-    ClosureArg = TE->getElement(NumArgs - 1);
-    if (NumArgs > 1)
-      PrevArg = TE->getElement(NumArgs - 2);
-  }
+  OriginalArgumentList ArgList = getOriginalArgumentList(Arg);
+
+  auto NumArgs = ArgList.args.size();
+  if (NumArgs == 0)
+    return true;
+  ClosureArg = ArgList.args[NumArgs - 1];
+  if (NumArgs > 1)
+    PrevArg = ArgList.args[NumArgs - 2];
+
   if (auto *ICE = dyn_cast<ImplicitConversionExpr>(ClosureArg))
     ClosureArg = ICE->getSyntacticSubExpr();
 
-  if (LPLoc.isInvalid() || RPLoc.isInvalid())
+  if (ArgList.lParenLoc.isInvalid() || ArgList.rParenLoc.isInvalid())
     return true;
 
   // Replace:
@@ -2918,14 +3089,14 @@ bool RefactoringActionTrailingClosure::performChange() {
     EditConsumer.accept(SM, PreRange, ") ");
   } else {
     CharSourceRange PreRange(
-        SM, LPLoc, ClosureArg->getStartLoc());
+        SM, ArgList.lParenLoc, ClosureArg->getStartLoc());
     EditConsumer.accept(SM, PreRange, " ");
   }
   // Remove original closing paren.
   CharSourceRange PostRange(
       SM,
       Lexer::getLocForEndOfToken(SM, ClosureArg->getEndLoc()),
-      Lexer::getLocForEndOfToken(SM, RPLoc));
+      Lexer::getLocForEndOfToken(SM, ArgList.rParenLoc));
   EditConsumer.remove(SM, PostRange);
   return false;
 }
@@ -2966,6 +3137,7 @@ static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 }// end of anonymous namespace
 
@@ -2977,6 +3149,7 @@ getDescriptiveRefactoringKindName(RefactoringKind Kind) {
 #define REFACTORING(KIND, NAME, ID) case RefactoringKind::KIND: return NAME;
 #include "swift/IDE/RefactoringKinds.def"
     }
+    llvm_unreachable("unhandled kind");
   }
 
   StringRef swift::ide::
@@ -2995,6 +3168,7 @@ getDescriptiveRefactoringKindName(RefactoringKind Kind) {
       case RenameAvailableKind::Unavailable_decl_from_clang:
         return "cannot rename a Clang symbol from its Swift reference";
     }
+    llvm_unreachable("unhandled kind");
   }
 
 SourceLoc swift::ide::RangeConfig::getStart(SourceManager &SM) {
@@ -3030,6 +3204,7 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
       case RefactoringRangeKind::SelectorArgumentLabel:
         return "sel";
     }
+    llvm_unreachable("unhandled kind");
   }
   void accept(SourceManager &SM, const RenameRangeDetail &Range) {
     std::string NewText;
@@ -3072,8 +3247,6 @@ swift::ide::collectRenameAvailabilityInfo(const ValueDecl *VD,
     AvailKind = RenameAvailableKind::Unavailable_has_no_location;
   } else if (!VD->hasName()) {
     AvailKind = RenameAvailableKind::Unavailable_has_no_name;
-  } else if (!VD->hasAccess()) {
-    return llvm::makeArrayRef(Scratch);
   }
 
   if (isa<AbstractFunctionDecl>(VD)) {
@@ -3167,10 +3340,11 @@ collectAvailableRefactorings(SourceFile *SF, RangeConfig Range,
   DiagnosticEngine DiagEngine(SM);
   std::for_each(DiagConsumers.begin(), DiagConsumers.end(),
     [&](DiagnosticConsumer *Con) { DiagEngine.addConsumer(*Con); });
-
-  RangeResolver Resolver(*SF, Range.getStart(SF->getASTContext().SourceMgr),
-                         Range.getEnd(SF->getASTContext().SourceMgr));
-  ResolvedRangeInfo Result = Resolver.resolve();
+  ResolvedRangeInfo Result = evaluateOrDefault(SF->getASTContext().evaluator,
+    RangeInfoRequest(RangeInfoOwner({SF,
+                      Range.getStart(SF->getASTContext().SourceMgr),
+                      Range.getEnd(SF->getASTContext().SourceMgr)})),
+                                               ResolvedRangeInfo());
 
   bool enableInternalRefactoring = getenv("SWIFT_ENABLE_INTERNAL_REFACTORING_ACTIONS");
 
@@ -3214,6 +3388,7 @@ case RefactoringKind::KIND: {                                                  \
     case RefactoringKind::None:
       llvm_unreachable("should not enter here.");
   }
+  llvm_unreachable("unhandled kind");
 }
 
 static std::vector<ResolvedLoc>
@@ -3287,7 +3462,7 @@ int swift::ide::syntacticRename(SourceFile *SF, ArrayRef<RenameLoc> RenameLocs,
     return true; // Already diagnosed.
 
   size_t index = 0;
-  llvm::StringMap<char> ReplaceTextContext;
+  llvm::StringSet<> ReplaceTextContext;
   for(const RenameLoc &Rename: RenameLocs) {
     ResolvedLoc &Resolved = ResolvedLocs[index++];
     TextReplacementsRenamer Renamer(SM, Rename.OldName, Rename.NewName,
@@ -3347,14 +3522,15 @@ int swift::ide::findLocalRenameRanges(
   Diags.addConsumer(DiagConsumer);
 
   auto StartLoc = Lexer::getLocForStartOfToken(SM, Range.getStart(SM));
-
-  CursorInfoResolver Resolver(*SF);
-  ResolvedCursorInfo CursorInfo = Resolver.resolve(StartLoc);
+  ResolvedCursorInfo CursorInfo =
+    evaluateOrDefault(SF->getASTContext().evaluator,
+                      CursorInfoRequest{CursorInfoOwner(SF, StartLoc)},
+                      ResolvedCursorInfo());
   if (!CursorInfo.isValid() || !CursorInfo.ValueD) {
     Diags.diagnose(StartLoc, diag::unresolved_location);
     return true;
   }
-  ValueDecl *VD = CursorInfo.ValueD;
+  ValueDecl *VD = CursorInfo.CtorTyRef ? CursorInfo.CtorTyRef : CursorInfo.ValueD;
   llvm::SmallVector<DeclContext *, 8> Scopes;
   analyzeRenameScope(VD, Diags, Scopes);
   if (Scopes.empty())

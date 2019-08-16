@@ -100,14 +100,14 @@ enum Voluntary<T> : Equatable {
       ()
 
     case .Twain(), // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
-         .Twain(_),
+         .Twain(_), // expected-warning {{cannot match several associated values at once, implicitly tupling the associated values and trying to match that instead}}
          .Twain(_, _),
          .Twain(_, _, _): // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
       ()
     }
 
     switch foo {
-    case .Naught: // expected-error{{pattern cannot match values of type 'Foo'}}
+    case .Naught: // expected-error{{type 'Foo' has no member 'Naught'}}
       ()
     case .A, .B, .C:
       ()
@@ -143,7 +143,7 @@ case Voluntary<Int>.Mere,
      .Mere(_):
   ()
 case .Twain,
-     .Twain(_),
+     .Twain(_), // expected-warning {{cannot match several associated values at once, implicitly tupling the associated values and trying to match that instead}}
      .Twain(_, _),
      .Twain(_, _, _): // expected-error{{tuple pattern has the wrong length for tuple type '(Int, Int)'}}
   ()
@@ -152,7 +152,7 @@ case .Twain,
 var notAnEnum = 0
 
 switch notAnEnum {
-case .Foo: // expected-error{{pattern cannot match values of type 'Int'}}
+case .Foo: // expected-error{{type 'Int' has no member 'Foo'}}
   ()
 }
 
@@ -280,11 +280,16 @@ case (1, 2, 3):
 
 // patterns in expression-only positions are errors.
 case +++(_, var d, 3):
-// expected-error@-1{{'+++' is not a prefix unary operator}}
+// expected-error@-1{{'_' can only appear in a pattern or on the left side of an assignment}}
+// expected-error@-2{{'var' binding pattern cannot appear in an expression}}
   ()
 case (_, var e, 3) +++ (1, 2, 3):
 // expected-error@-1{{'_' can only appear in a pattern}}
 // expected-error@-2{{'var' binding pattern cannot appear in an expression}}
+  ()
+case (let (_, _, _)) + 1:
+// expected-error@-1 2 {{'var' binding pattern cannot appear in an expression}}
+// expected-error@-2 {{expression pattern of type 'Int' cannot match values of type '(Int, Int, Int)'}}
   ()
 }
 
@@ -328,5 +333,6 @@ case (_?)?: break // expected-warning {{case is already handled by previous patt
 let (responseObject: Int?) = op1
 // expected-error @-1 {{expected ',' separator}} {{25-25=,}}
 // expected-error @-2 {{expected pattern}}
+// expected-error @-3 {{expression type 'Int?' is ambiguous without more context}}
 
 

@@ -1,25 +1,25 @@
 // RUN: %target-typecheck-verify-swift
 
-// XFAIL: linux
+// REQUIRES: objc_interop
 
 import Foundation
 
 // Common pitfall: trying to subscript a string with integers.
 func testIntSubscripting(s: String, i: Int) {
   // FIXME swift-3-indexing-model: test new overloads of ..<, ...
-  _ = s[i] // expected-error{{'subscript' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
-  _ = s[17] // expected-error{{'subscript' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
-  _ = s[i...i] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[17..<20] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[17...20] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[i] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
+  _ = s[17] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
+  _ = s[i...i] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[17..<20] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[17...20] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 
-  _ = s[Range(i...i)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[Range(17..<20)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[Range(17...20)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(i...i)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17..<20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17...20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 
-  _ = s[Range(i...i)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[Range(17..<20)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
-  _ = s[Range(17...20)] // expected-error{{'subscript' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(i...i)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17..<20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17...20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 }
 
 func testNonAmbiguousStringComparisons() {
@@ -80,4 +80,12 @@ func testStringCollectionTypes(s: String) {
   acceptsCollection(s)
   acceptsBidirectionalCollection(s)
   acceptsRandomAccessCollection(s) // expected-error{{argument type 'String' does not conform to expected type 'RandomAccessCollection'}}
+}
+
+// In previous versions of Swift, code would accidentally select
+// init(stringInterpolationSegment:) when String.init was used in the context
+// of a CustomStringConvertible type. This checks that we still have an
+// unambiguous overload for them to select.
+func testStringInitWithCustomStringConvertible() {
+  _ = [(1..<10)].map(String.init)
 }

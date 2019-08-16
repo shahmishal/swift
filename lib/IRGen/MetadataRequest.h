@@ -430,14 +430,27 @@ public:
            "failed to finish MetadataDependencyCollector");
   }
 
-  /// Check the dependency.  This takes a metadata and state separately
-  /// instead of taking a MetadataResponse because it's quite important
-  /// that we not rely on anything from MetadataResponse that might assume
-  /// that we've already done dependency collection.
+  /// Given the result of fetching metadata, check whether it creates a
+  /// metadata dependency, and branch if so.
+  ///
+  /// This takes a metadata and state separately instead of taking a
+  /// MetadataResponse pair because it's quite important that we not rely on
+  /// anything from MetadataResponse that might assume that we've already
+  /// done dependency collection.
   void checkDependency(IRGenFunction &IGF, DynamicMetadataRequest request,
                        llvm::Value *metadata, llvm::Value *state);
 
+  /// Given an optional MetadataDependency value (e.g. the result of calling
+  /// a dependency-returning function, in which a dependency is signalled
+  /// by a non-null metadata value), check whether it indicates a dependency
+  /// and branch if so.
+  void collect(IRGenFunction &IGF, llvm::Value *dependencyPair);
+
   MetadataDependency finish(IRGenFunction &IGF);
+
+private:
+  void emitCheckBranch(IRGenFunction &IGF, llvm::Value *satisfied,
+                       llvm::Value *metadata, llvm::Value *requiredState);
 };
 
 enum class MetadataAccessStrategy {
@@ -509,8 +522,8 @@ enum class CacheStrategy {
   /// A simple lazy cache.
   Lazy,
 
-  /// An InPlaceValueMetadataCache initialization cache.
-  InPlaceInitialization,
+  /// An SingletonMetadataCache initialization cache.
+  SingletonInitialization,
 };
 
 /// Emit a type metadata access function using the given generator function.
@@ -548,15 +561,6 @@ getGenericTypeMetadataAccessFunction(IRGenModule &IGM,
                                      NominalTypeDecl *nominal,
                                      ForDefinition_t shouldDefine);
 
-using OnceMetadataInitializer =
-  llvm::function_ref<llvm::Value*(IRGenFunction &IGF, llvm::Value *metadata)>;
-
-MetadataResponse
-emitOnceTypeMetadataAccessFunctionBody(IRGenFunction &IGF,
-                                       CanNominalType type,
-                                       llvm::Constant *cacheVariable,
-                                       OnceMetadataInitializer initializer);
-
 using CacheEmitter =
   llvm::function_ref<MetadataResponse(IRGenFunction &IGF, Explosion &params)>;
 
@@ -578,10 +582,6 @@ void emitMetatypeRef(IRGenFunction &IGF, CanMetatypeType type,
 ConstantReference tryEmitConstantTypeMetadataRef(IRGenModule &IGM,
                                                  CanType type,
                                                  SymbolReferenceKind refKind);
-
-/// Get the type as it exists in Swift's runtime type system, removing any
-/// erased generic parameters.
-CanType getRuntimeReifiedType(IRGenModule &IGM, CanType type);
 
 /// Emit a reference to a compile-time constant piece of heap metadata, or
 /// return a null pointer if the type's heap metadata cannot be represented

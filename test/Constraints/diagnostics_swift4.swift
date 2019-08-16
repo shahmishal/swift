@@ -6,7 +6,7 @@ func sr_2505(_ a: Any) {} // expected-note {{}}
 sr_2505()          // expected-error {{missing argument for parameter #1 in call}}
 sr_2505(a: 1)      // expected-error {{extraneous argument label 'a:' in call}}
 sr_2505(1, 2)      // expected-error {{extra argument in call}}
-sr_2505(a: 1, 2)   // expected-error {{extra argument 'a' in call}}
+sr_2505(a: 1, 2)   // expected-error {{extra argument in call}}
 
 struct C_2505 {
   init(_ arg: Any) {
@@ -54,5 +54,3 @@ class R<K: Hashable, V> {
 infix operator +=+ : AdditionPrecedence
 func +=+(_ lhs: Int, _ rhs: Int) -> Bool { return lhs == rhs }
 func +=+<T: BinaryInteger>(_ lhs: T, _ rhs: Int) -> Bool { return lhs == rhs }
-// FIXME: DoubleWidth is no longer part of the standard library
-// let _ = DoubleWidth<Int>(Int.min) - 1 +=+ Int.min // Ok

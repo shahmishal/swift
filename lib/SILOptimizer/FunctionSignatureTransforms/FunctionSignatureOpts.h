@@ -27,6 +27,7 @@
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/PassManager/PassManager.h"
 #include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "llvm/ADT/DenseMap.h"
 
@@ -126,8 +127,8 @@ struct ArgumentDescriptor {
   getTransformedOwnershipKind(SILType SubTy) {
     if (IsEntirelyDead)
       return None;
-    if (SubTy.isTrivial(Arg->getModule()))
-      return Optional<ValueOwnershipKind>(ValueOwnershipKind::Trivial);
+    if (SubTy.isTrivial(*Arg->getFunction()))
+      return Optional<ValueOwnershipKind>(ValueOwnershipKind::Any);
     if (OwnedToGuaranteed)
       return Optional<ValueOwnershipKind>(ValueOwnershipKind::Guaranteed);
     return Arg->getOwnershipKind();
@@ -216,6 +217,8 @@ struct FunctionSignatureTransformDescriptor {
 };
 
 class FunctionSignatureTransform {
+  SILOptFunctionBuilder &FunctionBuilder;
+
   /// A struct that contains all data that we use during our
   /// transformation. This is an initial step towards splitting this struct into
   /// multiple "transforms" that can be tested independently of each other.
@@ -284,12 +287,14 @@ private:
 public:
   /// Constructor.
   FunctionSignatureTransform(
+      SILOptFunctionBuilder &FunctionBuilder,
       SILFunction *F, RCIdentityAnalysis *RCIA, EpilogueARCAnalysis *EA,
       Mangle::FunctionSignatureSpecializationMangler &Mangler,
       llvm::SmallDenseMap<int, int> &AIM,
       llvm::SmallVector<ArgumentDescriptor, 4> &ADL,
       llvm::SmallVector<ResultDescriptor, 4> &RDL)
-      : TransformDescriptor{F, nullptr, AIM, false, ADL, RDL}, RCIA(RCIA),
+      : FunctionBuilder(FunctionBuilder),
+        TransformDescriptor{F, nullptr, AIM, false, ADL, RDL}, RCIA(RCIA),
         EA(EA) {}
 
   /// Return the optimized function.

@@ -72,6 +72,13 @@ canDuplicateOrMoveToPreheader(SILLoop *L, SILBasicBlock *Preheader,
     else if (isa<FunctionRefInst>(Inst)) {
       Move.push_back(Inst);
       Invariant.insert(Inst);
+    } else if (isa<DynamicFunctionRefInst>(Inst)) {
+      Move.push_back(Inst);
+      Invariant.insert(Inst);
+    }
+    else if (isa<PreviousDynamicFunctionRefInst>(Inst)) {
+      Move.push_back(Inst);
+      Invariant.insert(Inst);
     } else if (isa<IntegerLiteralInst>(Inst)) {
       Move.push_back(Inst);
       Invariant.insert(Inst);
@@ -102,7 +109,7 @@ static void mapOperands(SILInstruction *I,
 }
 
 static void updateSSAForUseOfValue(
-    SILSSAUpdater &Updater, SmallVectorImpl<SILPHIArgument *> &InsertedPHIs,
+    SILSSAUpdater &Updater, SmallVectorImpl<SILPhiArgument *> &InsertedPHIs,
     const llvm::DenseMap<ValueBase *, SILValue> &ValueMap,
     SILBasicBlock *Header, SILBasicBlock *EntryCheckBlock,
     SILValue Res) {
@@ -141,7 +148,7 @@ static void updateSSAForUseOfValue(
     Updater.RewriteUse(*Use);
   }
   // Canonicalize inserted phis to avoid extra BB Args.
-  for (SILPHIArgument *Arg : InsertedPHIs) {
+  for (SILPhiArgument *Arg : InsertedPHIs) {
     if (SILValue Inst = replaceBBArgWithCast(Arg)) {
       Arg->replaceAllUsesWith(Inst);
       // DCE+SimplifyCFG runs as a post-pass cleanup.
@@ -152,7 +159,7 @@ static void updateSSAForUseOfValue(
 }
 
 static void updateSSAForUseOfInst(
-    SILSSAUpdater &Updater, SmallVectorImpl<SILPHIArgument *> &InsertedPHIs,
+    SILSSAUpdater &Updater, SmallVectorImpl<SILPhiArgument *> &InsertedPHIs,
     const llvm::DenseMap<ValueBase *, SILValue> &ValueMap,
     SILBasicBlock *Header, SILBasicBlock *EntryCheckBlock,
     SILInstruction *Inst) {
@@ -166,7 +173,7 @@ static void
 rewriteNewLoopEntryCheckBlock(SILBasicBlock *Header,
                               SILBasicBlock *EntryCheckBlock,
                         const llvm::DenseMap<ValueBase *, SILValue> &ValueMap) {
-  SmallVector<SILPHIArgument *, 4> InsertedPHIs;
+  SmallVector<SILPhiArgument *, 4> InsertedPHIs;
   SILSSAUpdater Updater(&InsertedPHIs);
 
   // Fix PHIs (incoming arguments).
@@ -414,6 +421,10 @@ class LoopRotation : public SILFunctionTransform {
 
     SILFunction *F = getFunction();
     assert(F);
+    // FIXME: Add ownership support.
+    if (F->hasOwnership())
+      return;
+
     SILLoopInfo *LI = LA->get(F);
     assert(LI);
     DominanceInfo *DT = DA->get(F);

@@ -26,6 +26,7 @@
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFG.h"
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/Utils/ConstantFolding.h"
 #include "swift/SILOptimizer/Utils/SILInliner.h"
@@ -59,6 +60,7 @@ static unsigned MaxIterationsOfDominatorBasedSimplify = 10;
 
 namespace {
   class SimplifyCFG {
+    SILOptFunctionBuilder FuncBuilder;
     SILFunction &Fn;
     SILPassManager *PM;
 
@@ -70,14 +72,18 @@ namespace {
     llvm::SmallDenseMap<SILBasicBlock*, unsigned, 32> WorklistMap;
     // Keep track of loop headers - we don't want to jump-thread through them.
     SmallPtrSet<SILBasicBlock *, 32> LoopHeaders;
-    // The number of times jump threading was done through a block.
-    // Used to prevent infinite jump threading loops.
-    llvm::SmallDenseMap<SILBasicBlock*, unsigned, 8> JumpThreadedBlocks;
+    // The cost (~ number of copied instructions) of jump threading per basic
+    // block. Used to prevent infinite jump threading loops.
+    llvm::SmallDenseMap<SILBasicBlock *, int, 8> JumpThreadingCost;
 
     // Dominance and post-dominance info for the current function
     DominanceInfo *DT = nullptr;
 
     ConstantFolder ConstFolder;
+
+    // True if the function has a large amount of blocks. In this case we turn off some expensive
+    // optimizations.
+    bool isVeryLargeFunction = false;
 
     void constFoldingCallback(SILInstruction *I) {
       // If a terminal instruction gets constant folded (like cond_br), it
@@ -89,10 +95,10 @@ namespace {
     bool ShouldVerify;
     bool EnableJumpThread;
   public:
-    SimplifyCFG(SILFunction &Fn, SILPassManager *PM, bool Verify,
+    SimplifyCFG(SILFunction &Fn, SILTransform &T, bool Verify,
                 bool EnableJumpThread)
-        : Fn(Fn), PM(PM),
-          ConstFolder(PM->getOptions().AssertConfig,
+        : FuncBuilder(T), Fn(Fn), PM(T.getPassManager()),
+          ConstFolder(FuncBuilder, PM->getOptions().AssertConfig,
                       /* EnableDiagnostics */false,
                       [&](SILInstruction *I) { constFoldingCallback(I); }),
           ShouldVerify(Verify), EnableJumpThread(EnableJumpThread) {}
@@ -166,7 +172,7 @@ namespace {
                                        DominanceInfo *DT);
     bool dominatorBasedSimplify(DominanceAnalysis *DA);
 
-    /// \brief Remove the basic block if it has no predecessors. Returns true
+    /// Remove the basic block if it has no predecessors. Returns true
     /// If the block was removed.
     bool removeIfDead(SILBasicBlock *BB);
 
@@ -190,6 +196,7 @@ namespace {
     bool simplifyArgument(SILBasicBlock *BB, unsigned i);
     bool simplifyArgs(SILBasicBlock *BB);
     void findLoopHeaders();
+    bool simplifySwitchEnumOnObjcClassOptional(SwitchEnumInst *SEI);
   };
 
 } // end anonymous namespace
@@ -203,15 +210,8 @@ static bool isUsedOutsideOfBlock(SILValue V, SILBasicBlock *BB) {
 }
 
 /// Helper function to perform SSA updates in case of jump threading.
-void swift::updateSSAAfterCloning(BaseThreadingCloner &Cloner,
-                                  SILBasicBlock *SrcBB, SILBasicBlock *DestBB,
-                                  bool NeedToSplitCriticalEdges) {
-  // We are updating SSA form. This means we need to be able to insert phi
-  // nodes. To make sure we can do this split all critical edges from
-  // instructions that don't support block arguments.
-  if (NeedToSplitCriticalEdges)
-    splitAllCriticalEdges(*DestBB->getParent(), true, nullptr, nullptr);
-
+void swift::updateSSAAfterCloning(BasicBlockCloner &Cloner,
+                                  SILBasicBlock *SrcBB, SILBasicBlock *DestBB) {
   SILSSAUpdater SSAUp;
   for (auto AvailValPair : Cloner.AvailVals) {
     ValueBase *Inst = AvailValPair.first;
@@ -260,12 +260,11 @@ static SILValue getTerminatorCondition(TermInst *Term) {
 /// Is this basic block jump threadable.
 static bool isThreadableBlock(SILBasicBlock *BB,
                               SmallPtrSetImpl<SILBasicBlock *> &LoopHeaders) {
-  if (isa<ReturnInst>(BB->getTerminator()))
-    return false;
+  auto TI = BB->getTerminator();
 
-  // We know how to handle cond_br and switch_enum .
-  if (!isa<CondBranchInst>(BB->getTerminator()) &&
-      !isa<SwitchEnumInst>(BB->getTerminator()))
+  // We know how to handle cond_br and switch_enum.
+  if (!isa<CondBranchInst>(TI) &&
+      !isa<SwitchEnumInst>(TI))
     return false;
 
   if (LoopHeaders.count(BB))
@@ -277,7 +276,7 @@ static bool isThreadableBlock(SILBasicBlock *BB,
       return false;
 
     // Don't jumpthread function calls.
-    if (isa<ApplyInst>(Inst))
+    if (FullApplySite::isa(&Inst))
       return false;
 
     // Only thread 'small blocks'.
@@ -325,13 +324,13 @@ public:
                             << " to bb" << Dest->getDebugID() << '\n');
     auto *SrcTerm = cast<BranchInst>(Src->getTerminator());
 
-    EdgeThreadingCloner Cloner(SrcTerm);
-    for (auto &I : *Dest)
-      Cloner.process(&I);
+    BasicBlockCloner Cloner(SrcTerm->getDestBB());
+    Cloner.cloneBranchTarget(SrcTerm);
 
     // We have copied the threaded block into the edge.
-    Src = Cloner.getEdgeBB();
+    Src = Cloner.getNewBB();
 
+    // Rewrite the cloned branch to eliminate the non-taken path.
     if (auto *CondTerm = dyn_cast<CondBranchInst>(Src->getTerminator())) {
       // We know the direction this conditional branch is going to take thread
       // it.
@@ -370,14 +369,11 @@ public:
         Builder.createBranch(SEI->getLoc(), ThreadedSuccessorBlock,
                              ArrayRef<SILValue>());
       SEI->eraseFromParent();
-
-      // Split the edge from 'Dest' to 'ThreadedSuccessorBlock' it is now
-      // critical. Doing this here safes us from doing it over the whole
-      // function in updateSSAAfterCloning because we have split all other
-      // critical edges earlier.
-      splitEdgesFromTo(Dest, ThreadedSuccessorBlock, nullptr, nullptr);
     }
-    updateSSAAfterCloning(Cloner, Src, Dest, false);
+    // After rewriting the cloned branch, split the critical edge.
+    // This does not currently update DominanceInfo.
+    Cloner.splitCriticalEdges(nullptr, nullptr);
+    updateSSAAfterCloning(Cloner, Src, Dest);
   }
 };
 
@@ -660,7 +656,7 @@ bool SimplifyCFG::dominatorBasedSimplify(DominanceAnalysis *DA) {
   // also required for SSA construction in dominatorBasedSimplifications' jump
   // threading. It only splits new critical edges it creates by jump threading.
   bool Changed =
-      EnableJumpThread ? splitAllCriticalEdges(Fn, false, DT, nullptr) : false;
+      EnableJumpThread ? splitAllCriticalEdges(Fn, DT, nullptr) : false;
 
   unsigned MaxIter = MaxIterationsOfDominatorBasedSimplify;
   SmallVector<SILBasicBlock *, 16> BlocksForWorklist;
@@ -793,20 +789,13 @@ getEnumCaseRecursive(SILValue Val, SILBasicBlock *UsedInBB, int RecursionDepth,
   if (auto *Arg = dyn_cast<SILArgument>(Val)) {
     HandledArgs.insert(Arg);
     llvm::SmallVector<std::pair<SILBasicBlock *, SILValue>, 8> IncomingVals;
-    if (!Arg->getIncomingValues(IncomingVals))
+    if (!Arg->getIncomingPhiValues(IncomingVals))
       return nullptr;
 
     EnumElementDecl *CommonCase = nullptr;
     for (std::pair<SILBasicBlock *, SILValue> Incoming : IncomingVals) {
       SILBasicBlock *IncomingBlock = Incoming.first;
       SILValue IncomingVal = Incoming.second;
-      TermInst *TI = IncomingBlock->getTerminator();
-
-      // If the terminator of the incoming value is e.g. a switch_enum, the
-      // incoming value is the switch_enum operand and not the enum payload
-      // (which would be the real incoming value of the argument).
-      if (!isa<BranchInst>(TI) && !isa<CondBranchInst>(TI))
-        return nullptr;
 
       auto *IncomingArg = dyn_cast<SILArgument>(IncomingVal);
       if (IncomingArg && HandledArgs.count(IncomingArg) != 0)
@@ -973,7 +962,7 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
   auto *SrcBB = BI->getParent();
   // If the destination block ends with a return, we don't want to duplicate it.
   // We want to maintain the canonical form of a single return where possible.
-  if (isa<ReturnInst>(DestBB->getTerminator()))
+  if (DestBB->getTerminator()->isFunctionExiting())
     return false;
 
   // We need to update SSA if a value duplicated is used outside of the
@@ -1025,15 +1014,19 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
     }
   }
 
+  ThreadingBudget -= JumpThreadingCost[SrcBB];
+  ThreadingBudget -= JumpThreadingCost[DestBB];
+
   // If we don't have anything that we can simplify, don't do it.
-  if (ThreadingBudget == 0)
+  if (ThreadingBudget <= 0)
     return false;
 
   // If it looks potentially interesting, decide whether we *can* do the
   // operation and whether the block is small enough to be worth duplicating.
+  int copyCosts = 0;
   for (auto &Inst : *DestBB) {
-    ThreadingBudget -= getThreadingCost(&Inst);
-    if (ThreadingBudget <= 0)
+    copyCosts += getThreadingCost(&Inst);
+    if (ThreadingBudget <= copyCosts)
       return false;
 
     // We need to update ssa if a value is used outside the duplicated block.
@@ -1055,31 +1048,28 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
       return false;
   }
 
-  // Limit the number we jump-thread through a block.
-  // Otherwise we may end up with jump-threading indefinitely.
-  unsigned &NumThreaded = JumpThreadedBlocks[DestBB];
-  if (++NumThreaded > 16)
-    return false;
-
   LLVM_DEBUG(llvm::dbgs() << "jump thread from bb" << SrcBB->getDebugID()
                           << " to bb" << DestBB->getDebugID() << '\n');
+
+  JumpThreadingCost[DestBB] += copyCosts;
 
   // Okay, it looks like we want to do this and we can.  Duplicate the
   // destination block into this one, rewriting uses of the BBArgs to use the
   // branch arguments as we go.
-  EdgeThreadingCloner Cloner(BI);
+  BasicBlockCloner Cloner(DestBB);
+  Cloner.cloneBranchTarget(BI);
 
-  for (auto &I : *DestBB)
-    Cloner.process(&I);
+  // Does not currently update DominanceInfo.
+  Cloner.splitCriticalEdges(nullptr, nullptr);
 
   // Once all the instructions are copied, we can nuke BI itself.  We also add
   // the threaded and edge block to the worklist now that they (likely) can be
   // simplified.
   addToWorklist(SrcBB);
-  addToWorklist(Cloner.getEdgeBB());
+  addToWorklist(Cloner.getNewBB());
 
   if (NeedToUpdateSSA)
-    updateSSAAfterCloning(Cloner, Cloner.getEdgeBB(), DestBB);
+    updateSSAAfterCloning(Cloner, Cloner.getNewBB(), DestBB);
 
   // We may be able to simplify DestBB now that it has one fewer predecessor.
   simplifyAfterDroppingPredecessor(DestBB);
@@ -1240,11 +1230,13 @@ bool SimplifyCFG::simplifyBranchBlock(BranchInst *BI) {
       if (DestBB->getArgument(i) != BI->getArg(i)) {
         SILValue Val = BI->getArg(i);
         DestBB->getArgument(i)->replaceAllUsesWith(Val);
-        if (auto *I = dyn_cast<SingleValueInstruction>(Val)) {
-          // Replacing operands may trigger constant folding which then could
-          // trigger other simplify-CFG optimizations.
-          ConstFolder.addToWorklist(I);
-          ConstFolder.processWorkList();
+        if (!isVeryLargeFunction) {
+          if (auto *I = dyn_cast<SingleValueInstruction>(Val)) {
+            // Replacing operands may trigger constant folding which then could
+            // trigger other simplify-CFG optimizations.
+            ConstFolder.addToWorklist(I);
+            ConstFolder.processWorkList();
+          }
         }
       } else {
         // We must be processing an unreachable part of the cfg with a cycle.
@@ -1275,6 +1267,12 @@ bool SimplifyCFG::simplifyBranchBlock(BranchInst *BI) {
     if (LoopHeaders.count(DestBB))
       LoopHeaders.insert(BB);
 
+    auto Iter = JumpThreadingCost.find(DestBB);
+    if (Iter != JumpThreadingCost.end()) {
+      int costs = Iter->second;
+      JumpThreadingCost[BB] += costs;
+    }
+
     removeFromWorklist(DestBB);
     DestBB->eraseFromParent();
     ++NumBlocksMerged;
@@ -1297,20 +1295,21 @@ bool SimplifyCFG::simplifyBranchBlock(BranchInst *BI) {
     BI->eraseFromParent();
     removeIfDead(DestBB);
     addToWorklist(BB);
+
     return true;
   }
 
   // If this unconditional branch has BBArgs, check to see if duplicating the
   // destination would allow it to be simplified.  This is a simple form of jump
   // threading.
-  if (!BI->getArgs().empty() &&
+  if (!isVeryLargeFunction && !BI->getArgs().empty() &&
       tryJumpThreading(BI))
     return true;
 
   return Simplified;
 }
 
-/// \brief Check if replacing an existing edge of the terminator by another
+/// Check if replacing an existing edge of the terminator by another
 /// one which has a DestBB as its destination would create a critical edge.
 static bool wouldIntroduceCriticalEdge(TermInst *T, SILBasicBlock *DestBB) {
   auto SrcSuccs = T->getSuccessors();
@@ -1359,7 +1358,7 @@ static SILValue skipInvert(SILValue Cond, bool &Inverted,
   return Cond;
 }
 
-/// \brief Returns the first cond_fail if it is the first side-effect
+/// Returns the first cond_fail if it is the first side-effect
 /// instruction in this block.
 static CondFailInst *getFirstCondFail(SILBasicBlock *BB) {
   auto It = BB->begin();
@@ -1398,11 +1397,11 @@ static CondFailInst *getUnConditionalFail(SILBasicBlock *BB, SILValue Cond,
   return nullptr;
 }
 
-/// \brief Creates a new cond_fail instruction, optionally with an xor inverted
+/// Creates a new cond_fail instruction, optionally with an xor inverted
 /// condition.
-static void createCondFail(CondFailInst *Orig, SILValue Cond, bool inverted,
-                           SILBuilder &Builder) {
-  Builder.createCondFail(Orig->getLoc(), Cond, inverted);
+static void createCondFail(CondFailInst *Orig, SILValue Cond, StringRef Message,
+                           bool inverted, SILBuilder &Builder) {
+  Builder.createCondFail(Orig->getLoc(), Cond, Message, inverted);
 }
 
 /// Inverts the expected value of 'PotentialExpect' (if it is an expect
@@ -1644,7 +1643,7 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
   if (auto *TrueCFI = getUnConditionalFail(TrueSide, CFCondition, false)) {
     LLVM_DEBUG(llvm::dbgs() << "replace with cond_fail:" << *BI);
     SILBuilderWithScope Builder(BI);
-    createCondFail(TrueCFI, CFCondition, false, Builder);
+    createCondFail(TrueCFI, CFCondition, TrueCFI->getMessage(), false, Builder);
     SILBuilderWithScope(BI).createBranch(BI->getLoc(), FalseSide, FalseArgs);
 
     BI->eraseFromParent();
@@ -1656,7 +1655,7 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
   if (auto *FalseCFI = getUnConditionalFail(FalseSide, CFCondition, true)) {
     LLVM_DEBUG(llvm::dbgs() << "replace with inverted cond_fail:" << *BI);
     SILBuilderWithScope Builder(BI);
-    createCondFail(FalseCFI, CFCondition, true, Builder);
+    createCondFail(FalseCFI, CFCondition, FalseCFI->getMessage(), true, Builder);
     SILBuilderWithScope(BI).createBranch(BI->getLoc(), TrueSide, TrueArgs);
     
     BI->eraseFromParent();
@@ -1742,6 +1741,236 @@ bool SimplifyCFG::simplifySwitchEnumUnreachableBlocks(SwitchEnumInst *SEI) {
   addToWorklist(Dest);
 
   SEI->eraseFromParent();
+  return true;
+}
+
+/// Checks that the someBB only contains obj_method calls (possibly chained) on
+/// the optional value.
+///
+/// switch_enum %optionalValue, case #Optional.some!enumelt.1: someBB
+///
+/// someBB(%optionalPayload):
+///    %1 = objc_method %optionalPayload
+///    %2 = apply %1(..., %optionalPayload) // self position
+///    %3 = unchecked_ref_cast %2
+///    %4 = objc_method %3
+///    %... = apply %4(..., %3)
+///    br mergeBB(%...)
+static bool containsOnlyObjMethodCallOnOptional(SILValue optionalValue,
+                                                SILBasicBlock *someBB,
+                                                SILValue &outBranchArg,
+                                                SILValue &outOptionalPayload) {
+  SILValue optionalPayload;
+  SmallVector<SILValue, 4> optionalPayloads;
+  if (someBB->getNumArguments() == 1) {
+    optionalPayload = someBB->getArgument(0);
+    optionalPayloads.push_back(optionalPayload);
+  } else if (someBB->getNumArguments() != 0)
+    return false;
+
+  SmallVector<SILValue, 4> objCApplies;
+  for (auto &i : *someBB) {
+    SILInstruction *inst = &i;
+    if (onlyAffectsRefCount(inst))
+      continue;
+    if (inst->isDebugInstruction())
+      continue;
+    // An objc_method has no sideffects.
+    if (isa<ObjCMethodInst>(inst))
+      continue;
+
+    // An uncheckedEnumData has no sideeffects.
+    if (auto *uncheckedEnumData = dyn_cast<UncheckedEnumDataInst>(inst)) {
+      if (uncheckedEnumData->getOperand() != optionalValue)
+        continue;
+      optionalPayload = uncheckedEnumData;
+      optionalPayloads.push_back(uncheckedEnumData);
+      continue;
+    }
+
+    // An unchecked_ref_cast is safe.
+    if (auto *refCast = dyn_cast<UncheckedRefCastInst>(inst)) {
+      // An unchecked_ref_cast on a safe objc_method apply behaves like the
+      // optional (it is null if the optional was null).
+      if (refCast->getType().getClassOrBoundGenericClass() &&
+          std::find(objCApplies.begin(), objCApplies.end(),
+                    refCast->getOperand()) != objCApplies.end())
+        optionalPayloads.push_back(refCast);
+      continue;
+    }
+
+    // Applies on objc_methods where self is either the optional payload or the
+    // result of another 'safe' apply are safe.
+    if (auto *objcMethod = dyn_cast<ApplyInst>(inst)) {
+      if (!isa<ObjCMethodInst>(objcMethod->getCallee()))
+        return false;
+      if (std::find(optionalPayloads.begin(), optionalPayloads.end(),
+                    objcMethod->getSelfArgument()) == optionalPayloads.end())
+        return false;
+      objCApplies.push_back(objcMethod);
+      continue;
+    }
+
+    // The branch should forward one of the objc_method call.
+    if (auto *br = dyn_cast<BranchInst>(inst)) {
+      if (br->getNumArgs() == 0 || br->getNumArgs() > 1)
+        return false;
+      auto branchArg = br->getArg(0);
+      if (std::find(objCApplies.begin(), objCApplies.end(), branchArg) ==
+          objCApplies.end())
+        return false;
+      outBranchArg = branchArg;
+      continue;
+    }
+    // Unexpected instruction.
+    return false;
+  }
+  if (!optionalPayload)
+    return false;
+  outOptionalPayload = optionalPayload;
+  return true;
+}
+
+/// Check that all that noneBB does is forwarding none.
+/// The only other allowed operation are ref count operations.
+static bool onlyForwardsNone(SILBasicBlock *noneBB, SILBasicBlock *someBB,
+                             SwitchEnumInst *SEI) {
+  // It all the basic blocks leading up to the ultimate block we only expect
+  // reference count instructions.
+  while (noneBB->getSingleSuccessorBlock() != someBB->getSingleSuccessorBlock()) {
+    for (auto &i : *noneBB) {
+      auto *inst = &i;
+      if (isa<BranchInst>(inst) || onlyAffectsRefCount(inst) ||
+          inst->isDebugInstruction())
+        continue;
+      return false;
+    }
+    noneBB = noneBB->getSingleSuccessorBlock();
+  }
+  // The ultimate block forwards the Optional<...>.none value.
+  SILValue optionalNone;
+  for (auto &i : *noneBB) {
+    auto *inst = &i;
+    if (onlyAffectsRefCount(inst) || inst->isDebugInstruction())
+      continue;
+    if (auto *none = dyn_cast<EnumInst>(inst)) {
+      if (none->getElement() !=
+          SEI->getModule().getASTContext().getOptionalNoneDecl())
+        return false;
+      optionalNone = none;
+      continue;
+    }
+    if (auto *noneBranch = dyn_cast<BranchInst>(inst)) {
+      if (noneBranch->getNumArgs() != 1 ||
+          (noneBranch->getArg(0) != SEI->getOperand() &&
+           noneBranch->getArg(0) != optionalNone))
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Check whether \p noneBB has the same ultimate successor as the successor to someBB.
+///  someBB       noneBB
+///   \             |
+///    \            ... (more bbs?)
+///     \           /
+///       ulimateBB
+static bool hasSameUltimateSuccessor(SILBasicBlock *noneBB, SILBasicBlock *someBB) {
+  // Make sure that both our some, none blocks both have single successors that
+  // are not themselves (which can happen due to single block loops).
+  auto *someSuccessorBB = someBB->getSingleSuccessorBlock();
+  if (!someSuccessorBB || someSuccessorBB == someBB)
+    return false;
+  auto *noneSuccessorBB = noneBB->getSingleSuccessorBlock();
+  if (!noneSuccessorBB || noneSuccessorBB == noneBB)
+    return false;
+
+  // If we immediately find a diamond, return true. We are done.
+  if (noneSuccessorBB == someSuccessorBB)
+    return true;
+
+  // Otherwise, lets keep looking down the none case.
+  auto *next = noneSuccessorBB;
+  while (next != someSuccessorBB) {
+    noneSuccessorBB = next;
+    next = noneSuccessorBB->getSingleSuccessorBlock();
+
+    // If we find another single successor and it is not our own block (due to a
+    // self-loop), continue.
+    if (next && next != noneSuccessorBB)
+      continue;
+
+    // Otherwise, we either have multiple successors or a self-loop. We do not
+    // support this, return false.
+    return false;
+  }
+
+  // At this point, we know that next must be someSuccessorBB.
+  return true;
+}
+
+/// Simplify switch_enums on class enums that branch to objc_method calls on
+/// that optional on the #Optional.some side to always branch to the some side.
+///
+/// switch_enum %optionalValue, case #Optional.some!enumelt.1: someBB,
+///                             case #Optional.none: noneBB
+///
+/// someBB(%optionalPayload):
+///    %1 = objc_method %optionalPayload
+///    %2 = apply %1(..., %optionalPayload) // self position
+///    br mergeBB(%2)
+///
+/// noneBB:
+///    %4 = enum #Optional.none
+///    br mergeBB(%4)
+bool SimplifyCFG::simplifySwitchEnumOnObjcClassOptional(SwitchEnumInst *SEI) {
+  auto optional = SEI->getOperand();
+  auto optionalPayloadType = optional->getType().getOptionalObjectType();
+  if (!optionalPayloadType ||
+      !optionalPayloadType.getClassOrBoundGenericClass())
+    return false;
+
+  if (SEI->getNumCases() != 2)
+    return false;
+
+  auto *noneBB = SEI->getCase(0).second;
+  auto *someBB = SEI->getCase(1).second;
+  if (noneBB == someBB)
+    return false;
+  auto someDecl = SEI->getModule().getASTContext().getOptionalSomeDecl();
+  if (SEI->getCaseDestination(someDecl) != someBB)
+    std::swap(someBB, noneBB);
+
+  if (!hasSameUltimateSuccessor(noneBB, someBB))
+    return false;
+
+  if (!onlyForwardsNone(noneBB, someBB, SEI))
+    return false;
+
+  SILValue branchArg;
+  SILValue optionalPayload;
+  if (!containsOnlyObjMethodCallOnOptional(optional, someBB, branchArg,
+                                           optionalPayload))
+    return false;
+
+  SILBuilderWithScope Builder(SEI);
+  auto *payloadCast = Builder.createUncheckedRefCast(SEI->getLoc(), optional,
+                                                     optionalPayloadType);
+  optionalPayload->replaceAllUsesWith(payloadCast);
+  auto *switchBB = SEI->getParent();
+  if (someBB->getNumArguments())
+    Builder.createBranch(SEI->getLoc(), someBB, SILValue(payloadCast));
+  else
+    Builder.createBranch(SEI->getLoc(), someBB);
+
+  SEI->eraseFromParent();
+  addToWorklist(switchBB);
+  simplifyAfterDroppingPredecessor(noneBB);
+  addToWorklist(someBB);
+  ++NumConstantFolded;
   return true;
 }
 
@@ -1857,6 +2086,26 @@ bool SimplifyCFG::simplifySwitchValueBlock(SwitchValueInst *SVI) {
   return simplifyTermWithIdenticalDestBlocks(ThisBB);
 }
 
+bool onlyContainsRefcountAndDeallocStackInst(
+    SILBasicBlock::reverse_iterator I, SILBasicBlock::reverse_iterator End) {
+  while (I != End) {
+    auto MaybeDead = I++;
+    switch (MaybeDead->getKind()) {
+      // These technically have side effects, but not ones that matter
+      // in a block that we shouldn't really reach...
+    case SILInstructionKind::StrongRetainInst:
+    case SILInstructionKind::StrongReleaseInst:
+    case SILInstructionKind::RetainValueInst:
+    case SILInstructionKind::ReleaseValueInst:
+    case SILInstructionKind::DeallocStackInst:
+      break;
+
+    default:
+      return false;
+    }
+  }
+  return true;
+}
 /// simplifyUnreachableBlock - Simplify blocks ending with unreachable by
 /// removing instructions that are safe to delete backwards until we
 /// hit an instruction we cannot delete.
@@ -1866,6 +2115,8 @@ bool SimplifyCFG::simplifyUnreachableBlock(UnreachableInst *UI) {
   auto I = std::next(BB->rbegin());
   auto End = BB->rend();
   SmallVector<SILInstruction *, 8> DeadInstrs;
+
+  bool canIgnoreRestOfBlock = false;
 
   // Walk backwards deleting instructions that should be safe to delete
   // in a block that ends with unreachable.
@@ -1880,10 +2131,19 @@ bool SimplifyCFG::simplifyUnreachableBlock(UnreachableInst *UI) {
     case SILInstructionKind::RetainValueInst:
     case SILInstructionKind::ReleaseValueInst:
       break;
-
+    // We can only ignore a dealloc_stack instruction if we can ignore all
+    // instructions in the block.
+    case SILInstructionKind::DeallocStackInst: {
+      if (canIgnoreRestOfBlock ||
+          onlyContainsRefcountAndDeallocStackInst(MaybeDead, End)) {
+        canIgnoreRestOfBlock = true;
+        break;
+      }
+      LLVM_FALLTHROUGH;
+    }
     default:
       if (MaybeDead->mayHaveSideEffects()) {
-        if (Changed)
+         if (Changed)
           for (auto Dead : DeadInstrs)
             Dead->eraseFromParent();
         return Changed;
@@ -1917,19 +2177,26 @@ bool SimplifyCFG::simplifyCheckedCastBranchBlock(CheckedCastBranchInst *CCBI) {
   auto ThisBB = CCBI->getParent();
 
   bool MadeChange = false;
-  CastOptimizer CastOpt([&MadeChange](SILInstruction *I,
-                    ValueBase *V) {  /* ReplaceInstUsesAction */
+  CastOptimizer CastOpt(
+      FuncBuilder, nullptr /*SILBuilderContext*/,
+      /* replaceValueUsesAction */
+      [&MadeChange](SILValue oldValue, SILValue newValue) {
         MadeChange = true;
       },
-      [&MadeChange](SILInstruction *I) { /* EraseInstAction */
+      /* replaceInstUsesAction */
+      [&MadeChange](SILInstruction *I, ValueBase *V) { MadeChange = true; },
+      /* eraseInstAction */
+      [&MadeChange](SILInstruction *I) {
         MadeChange = true;
         I->eraseFromParent();
       },
-      [&]() { /* WillSucceedAction */
+      /* willSucceedAction */
+      [&]() {
         MadeChange |= removeIfDead(FailureBB);
         addToWorklist(ThisBB);
       },
-      [&]() { /* WillFailAction */
+      /* willFailAction */
+      [&]() {
         MadeChange |= removeIfDead(SuccessBB);
         addToWorklist(ThisBB);
       });
@@ -1946,21 +2213,27 @@ bool SimplifyCFG::simplifyCheckedCastValueBranchBlock(
 
   bool MadeChange = false;
   CastOptimizer CastOpt(
-      [&MadeChange](SILInstruction *I,
-                    ValueBase *V) { /* ReplaceInstUsesAction */
-                                    MadeChange = true;
+      FuncBuilder, nullptr /*SILBuilderContext*/,
+      /* replaceValueUsesAction */
+      [&MadeChange](SILValue oldValue, SILValue newValue) {
+        MadeChange = true;
       },
-      [&MadeChange](SILInstruction *I) { /* EraseInstAction */
-                                         MadeChange = true;
-                                         I->eraseFromParent();
+      /* replaceInstUsesAction */
+      [&MadeChange](SILInstruction *I, ValueBase *V) { MadeChange = true; },
+      /* eraseInstAction */
+      [&MadeChange](SILInstruction *I) {
+        MadeChange = true;
+        I->eraseFromParent();
       },
-      [&]() { /* WillSucceedAction */
-              MadeChange |= removeIfDead(FailureBB);
-              addToWorklist(ThisBB);
+      /* willSucceedAction */
+      [&]() {
+        MadeChange |= removeIfDead(FailureBB);
+        addToWorklist(ThisBB);
       },
-      [&]() { /* WillFailAction */
-              MadeChange |= removeIfDead(SuccessBB);
-              addToWorklist(ThisBB);
+      /* willFailAction */
+      [&]() {
+        MadeChange |= removeIfDead(SuccessBB);
+        addToWorklist(ThisBB);
       });
 
   MadeChange |= bool(CastOpt.simplifyCheckedCastValueBranchInst(CCBI));
@@ -1975,18 +2248,24 @@ simplifyCheckedCastAddrBranchBlock(CheckedCastAddrBranchInst *CCABI) {
   auto ThisBB = CCABI->getParent();
 
   bool MadeChange = false;
-  CastOptimizer CastOpt([&MadeChange](SILInstruction *I, ValueBase *V) {
-        MadeChange = true;
-      }, /* ReplaceInstUsesAction */
-      [&MadeChange](SILInstruction *I) { /* EraseInstAction */
+  CastOptimizer CastOpt(
+      FuncBuilder, nullptr /*SILBuilderContext*/,
+      /* replaceValueUsesAction */
+      [&MadeChange](SILValue, SILValue) { MadeChange = true; },
+      /* replaceInstUsesAction */
+      [&MadeChange](SILInstruction *I, ValueBase *V) { MadeChange = true; },
+      /* eraseInstAction */
+      [&MadeChange](SILInstruction *I) {
         MadeChange = true;
         I->eraseFromParent();
       },
-      [&]() { /* WillSucceedAction */
+      /* willSucceedAction */
+      [&]() {
         MadeChange |= removeIfDead(FailureBB);
         addToWorklist(ThisBB);
       },
-      [&]() { /* WillFailAction */
+      /* willFailAction */
+      [&]() {
         MadeChange |= removeIfDead(SuccessBB);
         addToWorklist(ThisBB);
       });
@@ -2228,7 +2507,7 @@ static bool tryMoveCondFailToPreds(SILBasicBlock *BB) {
     if (somePredsAreConst)
       continue;
 
-    SILValue incoming = condArg->getIncomingValue(Pred);
+    SILValue incoming = condArg->getIncomingPhiValue(Pred);
     somePredsAreConst |= isa<IntegerLiteralInst>(incoming);
   }
 
@@ -2239,10 +2518,10 @@ static bool tryMoveCondFailToPreds(SILBasicBlock *BB) {
 
   // Move the cond_fail to the predecessor blocks.
   for (auto *Pred : BB->getPredecessorBlocks()) {
-    SILValue incoming = condArg->getIncomingValue(Pred);
+    SILValue incoming = condArg->getIncomingPhiValue(Pred);
     SILBuilderWithScope Builder(Pred->getTerminator());
     
-    createCondFail(CFI, incoming, inverted, Builder);
+    createCondFail(CFI, incoming, CFI->getMessage(), inverted, Builder);
   }
   CFI->eraseFromParent();
   return true;
@@ -2280,7 +2559,9 @@ bool SimplifyCFG::simplifyBlocks() {
     case TermKind::SwitchEnumInst: {
       auto *SEI = cast<SwitchEnumInst>(TI);
       if (simplifySwitchEnumBlock(SEI)) {
-        Changed = false;
+        Changed = true;
+      } else if (simplifySwitchEnumOnObjcClassOptional(SEI)) {
+        Changed = true;
       } else {
         Changed |= simplifySwitchEnumUnreachableBlocks(SEI);
       }
@@ -2393,7 +2674,7 @@ static bool shouldTailDuplicate(SILBasicBlock &Block) {
   unsigned Cost = 0;
   bool SawRelease = false;
 
-  if (isa<ReturnInst>(Block.getTerminator()))
+  if (Block.getTerminator()->isFunctionExiting())
     return false;
 
   if (Block.getSinglePredecessorBlock())
@@ -2403,7 +2684,7 @@ static bool shouldTailDuplicate(SILBasicBlock &Block) {
     if (!Inst.isTriviallyDuplicatable())
       return false;
 
-    if (isa<ApplyInst>(&Inst))
+    if (FullApplySite::isa(&Inst))
       return false;
 
     if (isa<ReleaseValueInst>(&Inst) ||
@@ -2442,95 +2723,17 @@ bool SimplifyCFG::tailDuplicateObjCMethodCallSuccessorBlocks() {
     // Okay, it looks like we want to do this and we can.  Duplicate the
     // destination block into this one, rewriting uses of the BBArgs to use the
     // branch arguments as we go.
-    EdgeThreadingCloner Cloner(Branch);
+    BasicBlockCloner Cloner(DestBB);
+    Cloner.cloneBranchTarget(Branch);
 
-    for (auto &I : *DestBB)
-      Cloner.process(&I);
+    // Does not currently update DominanceInfo.
+    Cloner.splitCriticalEdges(nullptr, nullptr);
 
-    updateSSAAfterCloning(Cloner, Cloner.getEdgeBB(), DestBB);
-    addToWorklist(Cloner.getEdgeBB());
+    updateSSAAfterCloning(Cloner, Cloner.getNewBB(), DestBB);
+    addToWorklist(Cloner.getNewBB());
   }
 
   return Changed;
-}
-
-static void
-deleteTriviallyDeadOperandsOfDeadArgument(MutableArrayRef<Operand> TermOperands,
-                                          unsigned DeadArgIndex, SILModule &M) {
-  Operand &Op = TermOperands[DeadArgIndex];
-  auto *I = Op.get()->getDefiningInstruction();
-  if (!I)
-    return;
-  Op.set(SILUndef::get(Op.get()->getType(), M));
-  recursivelyDeleteTriviallyDeadInstructions(I);
-}
-
-static void removeArgumentFromTerminator(SILBasicBlock *BB, SILBasicBlock *Dest,
-                                         int idx) {
-  TermInst *Branch = BB->getTerminator();
-  SILBuilderWithScope Builder(Branch);
-  LLVM_DEBUG(llvm::dbgs() << "remove dead argument " << idx << " from "
-                          << *Branch);
-
-  if (auto *CBI = dyn_cast<CondBranchInst>(Branch)) {
-    SmallVector<SILValue, 8> TrueArgs;
-    SmallVector<SILValue, 8> FalseArgs;
-
-    for (auto A : CBI->getTrueArgs())
-      TrueArgs.push_back(A);
-
-    for (auto A : CBI->getFalseArgs())
-      FalseArgs.push_back(A);
-
-    if (Dest == CBI->getTrueBB()) {
-      deleteTriviallyDeadOperandsOfDeadArgument(CBI->getTrueOperands(), idx,
-                                                BB->getModule());
-      TrueArgs.erase(TrueArgs.begin() + idx);
-    }
-
-    if (Dest == CBI->getFalseBB()) {
-      deleteTriviallyDeadOperandsOfDeadArgument(CBI->getFalseOperands(), idx,
-                                                BB->getModule());
-      FalseArgs.erase(FalseArgs.begin() + idx);
-    }
-
-    Builder.createCondBranch(CBI->getLoc(), CBI->getCondition(),
-                             CBI->getTrueBB(), TrueArgs, CBI->getFalseBB(),
-                             FalseArgs, CBI->getTrueBBCount(),
-                             CBI->getFalseBBCount());
-    Branch->eraseFromParent();
-    return;
-  }
-
-  if (auto *BI = dyn_cast<BranchInst>(Branch)) {
-    SmallVector<SILValue, 8> Args;
-
-    for (auto A : BI->getArgs())
-      Args.push_back(A);
-
-    deleteTriviallyDeadOperandsOfDeadArgument(BI->getAllOperands(), idx,
-                                              BB->getModule());
-    Args.erase(Args.begin() + idx);
-    Builder.createBranch(BI->getLoc(), BI->getDestBB(), Args);
-    Branch->eraseFromParent();
-    return;
-  }
-  llvm_unreachable("unsupported terminator");
-}
-
-static void removeArgument(SILBasicBlock *BB, unsigned i) {
-  NumDeadArguments++;
-  BB->eraseArgument(i);
-
-  // Determine the set of predecessors in case any predecessor has
-  // two edges to this block (e.g. a conditional branch where both
-  // sides reach this block).
-  llvm::SmallPtrSet<SILBasicBlock *, 4> PredBBs;
-  for (auto *Pred : BB->getPredecessorBlocks())
-    PredBBs.insert(Pred);
-
-  for (auto *Pred : PredBBs)
-    removeArgumentFromTerminator(Pred, BB, i);
 }
 
 namespace {
@@ -2621,11 +2824,12 @@ void ArgumentSplitter::replaceIncomingArgs(
 }
 
 bool ArgumentSplitter::createNewArguments() {
-  SILModule &Mod = Arg->getModule();
+  auto *F = Arg->getFunction();
+  SILModule &Mod = F->getModule();
   SILBasicBlock *ParentBB = Arg->getParent();
 
   // Grab the incoming values. Return false if we can't find them.
-  if (!Arg->getIncomingValues(IncomingValues))
+  if (!Arg->getIncomingPhiValues(IncomingValues))
     return false;
 
   // Only handle struct and tuple type.
@@ -2643,7 +2847,7 @@ bool ArgumentSplitter::createNewArguments() {
   // We do not want to split arguments that have less than 2 non-trivial
   // projections.
   if (count_if(Projections, [&](const Projection &P) {
-        return !P.getType(Ty, Mod).isTrivial(Mod);
+        return !P.getType(Ty, Mod).isTrivial(*F);
       }) < 2)
     return false;
 
@@ -2655,7 +2859,7 @@ bool ArgumentSplitter::createNewArguments() {
   // old one.
   llvm::SmallVector<SILValue, 4> NewArgumentValues;
   for (auto &P : Projections) {
-    auto *NewArg = ParentBB->createPHIArgument(P.getType(Ty, Mod),
+    auto *NewArg = ParentBB->createPhiArgument(P.getType(Ty, Mod),
                                                ValueOwnershipKind::Owned);
     // This is unfortunate, but it feels wrong to put in an API into SILBuilder
     // that only takes in arguments.
@@ -2768,7 +2972,8 @@ bool ArgumentSplitter::split() {
       Worklist.push_back(A);
       continue;
     }
-    removeArgument(ParentBB, i);
+    erasePhiArgument(ParentBB, i);
+    ++NumDeadArguments;
   }
 
   return true;
@@ -2821,6 +3026,9 @@ bool SimplifyCFG::run() {
 
   LLVM_DEBUG(llvm::dbgs() << "### Run SimplifyCFG on " << Fn.getName() << '\n');
 
+  // Disable some expensive optimizations if the function is huge.
+  isVeryLargeFunction = (Fn.size() > 10000);
+
   // First remove any block not reachable from the entry.
   bool Changed = removeUnreachableBlocks(Fn);
 
@@ -2864,13 +3072,11 @@ bool SimplifyCFG::run() {
     if (simplifyBlocks())
       removeUnreachableBlocks(Fn);
   }
-
-  // Split all critical edges from non cond_br terminators.
-  Changed |= splitAllCriticalEdges(Fn, true, nullptr, nullptr);
+  Fn.verifyCriticalEdges();
 
   // Canonicalize switch_enum instructions.
   Changed |= canonicalizeSwitchEnums();
-  
+
   return Changed;
 }
 
@@ -3431,9 +3637,9 @@ bool SimplifyCFG::simplifyArgument(SILBasicBlock *BB, unsigned i) {
   // Okay, we'll replace the BB arg with one with the right type, replace
   // the uses in this block, and then rewrite the branch operands.
   LLVM_DEBUG(llvm::dbgs() << "unwrap argument:" << *A);
-  A->replaceAllUsesWith(SILUndef::get(A->getType(), BB->getModule()));
+  A->replaceAllUsesWith(SILUndef::get(A->getType(), *BB->getParent()));
   auto *NewArg =
-      BB->replacePHIArgument(i, proj->getType(), ValueOwnershipKind::Owned);
+      BB->replacePhiArgument(i, proj->getType(), ValueOwnershipKind::Owned);
   proj->replaceAllUsesWith(NewArg);
 
   // Rewrite the branch operand for each incoming branch.
@@ -3455,7 +3661,7 @@ static void tryToReplaceArgWithIncomingValue(SILBasicBlock *BB, unsigned i,
                                              DominanceInfo *DT) {
   auto *A = BB->getArgument(i);
   SmallVector<SILValue, 4> Incoming;
-  if (!A->getIncomingValues(Incoming) || Incoming.empty())
+  if (!A->getIncomingPhiValues(Incoming) || Incoming.empty())
     return;
   
   SILValue V = Incoming[0];
@@ -3507,7 +3713,8 @@ bool SimplifyCFG::simplifyArgs(SILBasicBlock *BB) {
       continue;
     }
 
-    removeArgument(BB, i);
+    erasePhiArgument(BB, i);
+    ++NumDeadArguments;
     Changed = true;
   }
 
@@ -3570,7 +3777,11 @@ namespace {
 class SimplifyCFGPass : public SILFunctionTransform {
 public:
   void run() override {
-    if (SimplifyCFG(*getFunction(), PM, getOptions().VerifyAll,
+    // FIXME: We should be able to handle ownership.
+    if (getFunction()->hasOwnership())
+      return;
+
+    if (SimplifyCFG(*getFunction(), *this, getOptions().VerifyAll,
                     /*EnableJumpThread=*/false)
             .run())
       invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
@@ -3587,7 +3798,10 @@ namespace {
 class JumpThreadSimplifyCFGPass : public SILFunctionTransform {
 public:
   void run() override {
-    if (SimplifyCFG(*getFunction(), PM, getOptions().VerifyAll,
+    // FIXME: Handle ownership.
+    if (getFunction()->hasOwnership())
+      return;
+    if (SimplifyCFG(*getFunction(), *this, getOptions().VerifyAll,
                     /*EnableJumpThread=*/true)
             .run())
       invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
@@ -3616,9 +3830,11 @@ public:
   void run() override {
     auto &Fn = *getFunction();
 
+    if (OnlyNonCondBrEdges)
+      Fn.verifyCriticalEdges();
+
     // Split all critical edges from all or non only cond_br terminators.
-    bool Changed =
-        splitAllCriticalEdges(Fn, OnlyNonCondBrEdges, nullptr, nullptr);
+    bool Changed = splitAllCriticalEdges(Fn, nullptr, nullptr);
 
     if (Changed) {
       invalidateAnalysis(SILAnalysis::InvalidationKind::BranchesAndInstructions);
@@ -3634,7 +3850,7 @@ public:
   
   /// The entry point to the transformation.
   void run() override {
-    if (SimplifyCFG(*getFunction(), PM, getOptions().VerifyAll, false)
+    if (SimplifyCFG(*getFunction(), *this, getOptions().VerifyAll, false)
         .simplifyBlockArgs()) {
       invalidateAnalysis(SILAnalysis::InvalidationKind::BranchesAndInstructions);
     }

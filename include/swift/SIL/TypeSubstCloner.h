@@ -30,8 +30,13 @@
 
 namespace swift {
 
-/// TypeSubstCloner - a utility class for cloning code while remapping types.
-template<typename ImplClass>
+/// A utility class for cloning code while remapping types.
+///
+/// \tparam FunctionBuilderTy Function builder type injected by
+/// subclasses. Used to break a circular dependency from SIL <=>
+/// SILOptimizer that would be caused by us needing to use
+/// SILOptFunctionBuilder here.
+template<typename ImplClass, typename FunctionBuilderTy>
 class TypeSubstCloner : public SILClonerWithScopes<ImplClass> {
   friend class SILInstructionVisitor<ImplClass>;
   friend class SILCloner<ImplClass>;
@@ -64,7 +69,7 @@ class TypeSubstCloner : public SILClonerWithScopes<ImplClass> {
 
       if (!Cloner.Inlining) {
         FunctionRefInst *FRI = dyn_cast<FunctionRefInst>(AI.getCallee());
-        if (FRI && FRI->getReferencedFunction() == AI.getFunction() &&
+        if (FRI && FRI->getInitiallyReferencedFunction() == AI.getFunction() &&
             Subs == Cloner.SubsMap) {
           // Handle recursions by replacing the apply to the callee with an
           // apply to the newly specialized function, but only if substitutions
@@ -130,8 +135,8 @@ public:
   using SILClonerWithScopes<ImplClass>::getTypeInClonedContext;
   using SILClonerWithScopes<ImplClass>::getOpType;
   using SILClonerWithScopes<ImplClass>::getOpBasicBlock;
-  using SILClonerWithScopes<ImplClass>::doPostProcess;
-  using SILClonerWithScopes<ImplClass>::ValueMap;
+  using SILClonerWithScopes<ImplClass>::recordClonedInstruction;
+  using SILClonerWithScopes<ImplClass>::recordFoldedValue;
   using SILClonerWithScopes<ImplClass>::addBlockWithUnreachable;
   using SILClonerWithScopes<ImplClass>::OpenedArchetypesTracker;
 
@@ -157,7 +162,6 @@ public:
       Original(From),
       Inlining(Inlining) {
   }
-
 
 protected:
   SILType remapType(SILType Ty) {
@@ -189,7 +193,14 @@ protected:
                                  Helper.getArguments(), Inst->isNonThrowing(),
                                  GenericSpecializationInformation::create(
                                    Inst, getBuilder()));
-    doPostProcess(Inst, N);
+    // Specialization can return noreturn applies that were not identified as
+    // such before.
+    if (N->isCalleeNoReturn() &&
+        !isa<UnreachableInst>(*std::next(SILBasicBlock::iterator(Inst)))) {
+      noReturnApplies.push_back(N);
+    }
+
+    recordClonedInstruction(Inst, N);
   }
 
   void visitTryApplyInst(TryApplyInst *Inst) {
@@ -201,7 +212,7 @@ protected:
         getOpBasicBlock(Inst->getErrorBB()),
         GenericSpecializationInformation::create(
           Inst, getBuilder()));
-    doPostProcess(Inst, N);
+    recordClonedInstruction(Inst, N);
   }
 
   void visitPartialApplyInst(PartialApplyInst *Inst) {
@@ -211,9 +222,9 @@ protected:
     PartialApplyInst *N = getBuilder().createPartialApply(
         getOpLocation(Inst->getLoc()), Helper.getCallee(),
         Helper.getSubstitutions(), Helper.getArguments(), ParamConvention,
-        GenericSpecializationInformation::create(
-          Inst, getBuilder()));
-    doPostProcess(Inst, N);
+        Inst->isOnStack(),
+        GenericSpecializationInformation::create(Inst, getBuilder()));
+    recordClonedInstruction(Inst, N);
   }
 
   /// Attempt to simplify a conditional checked cast.
@@ -254,7 +265,7 @@ protected:
     // there is no need for an upcast and we can just use the operand.
     if (getOpType(Upcast->getType()) ==
         getOpValue(Upcast->getOperand())->getType()) {
-      ValueMap.insert({SILValue(Upcast), getOpValue(Upcast->getOperand())});
+      recordFoldedValue(SILValue(Upcast), getOpValue(Upcast->getOperand()));
       return;
     }
     super::visitUpcastInst(Upcast);
@@ -263,8 +274,8 @@ protected:
   void visitCopyValueInst(CopyValueInst *Copy) {
     // If the substituted type is trivial, ignore the copy.
     SILType copyTy = getOpType(Copy->getType());
-    if (copyTy.isTrivial(Copy->getModule())) {
-      ValueMap.insert({SILValue(Copy), getOpValue(Copy->getOperand())});
+    if (copyTy.isTrivial(*Copy->getFunction())) {
+      recordFoldedValue(SILValue(Copy), getOpValue(Copy->getOperand()));
       return;
     }
     super::visitCopyValueInst(Copy);
@@ -273,7 +284,7 @@ protected:
   void visitDestroyValueInst(DestroyValueInst *Destroy) {
     // If the substituted type is trivial, ignore the destroy.
     SILType destroyTy = getOpType(Destroy->getOperand()->getType());
-    if (destroyTy.isTrivial(Destroy->getModule())) {
+    if (destroyTy.isTrivial(*Destroy->getFunction())) {
       return;
     }
     super::visitDestroyValueInst(Destroy);
@@ -293,15 +304,15 @@ protected:
     if (SubsMap.empty())
       return false;
 
-    auto Params = Sig->getSubstitutableParams();
-    return std::any_of(Params.begin(), Params.end(), [&](Type ParamType) {
-      // FIXME: It would be more elegant to run
-      // SubsMap.mapReplacementTypesOutOfContext() bup front, but it can assert.
-      Type Substitution = Type(ParamType).subst(SubsMap)->mapTypeOutOfContext();
-      return !Substitution->isOpenedExistential() &&
-             (Substitution->getCanonicalType() !=
-              ParamType->getCanonicalType());
+    bool Result = false;
+    Sig->forEachParam([&](GenericTypeParamType *ParamType, bool Canonical) {
+      if (!Canonical)
+        return;
+      if (!Type(ParamType).subst(SubsMap)->isEqual(ParamType))
+        Result = true;
     });
+
+    return Result;
   }
 
   enum { ForInlining = true };
@@ -309,7 +320,8 @@ protected:
   /// necessary when inlining said function into a new generic context.
   /// \param SubsMap - the substitutions of the inlining/specialization process.
   /// \param RemappedSig - the generic signature.
-  static SILFunction *remapParentFunction(SILModule &M,
+  static SILFunction *remapParentFunction(FunctionBuilderTy &FuncBuilder,
+                                          SILModule &M,
                                           SILFunction *ParentFunction,
                                           SubstitutionMap SubsMap,
                                           GenericSignature *RemappedSig,
@@ -320,14 +332,15 @@ protected:
     if (!RemappedSig || !OriginalEnvironment)
       return ParentFunction;
 
-    if (!substitutionsChangeGenericTypeParameters(SubsMap, RemappedSig))
-      return ParentFunction;
-
     if (SubsMap.hasArchetypes())
       SubsMap = SubsMap.mapReplacementTypesOutOfContext();
 
-    // This is a bug in mapReplacementTypesOutOfContext(). Archetypes can't be
-    // mangled, only type parameters can; ignore this for now.
+    if (!substitutionsChangeGenericTypeParameters(SubsMap, RemappedSig))
+      return ParentFunction;
+
+    // Note that mapReplacementTypesOutOfContext() can't do anything for
+    // opened existentials, and since archetypes can't be mangled, ignore
+    // this case for now.
     if (SubsMap.hasArchetypes())
       return ParentFunction;
 
@@ -344,12 +357,12 @@ protected:
       // Create a new function with this mangled name with an empty
       // body. There won't be any IR generated for it (hence the linkage),
       // but the symbol will be refered to by the debug info metadata.
-      SILFunctionBuilder B(M);
-      ParentFunction = B.getOrCreateFunction(
+      ParentFunction = FuncBuilder.getOrCreateFunction(
           ParentFunction->getLocation(), MangledName, SILLinkage::Shared,
           ParentFunction->getLoweredFunctionType(), ParentFunction->isBare(),
-          ParentFunction->isTransparent(), ParentFunction->isSerialized(), 0,
-          ParentFunction->isThunk(), ParentFunction->getClassSubclassScope());
+          ParentFunction->isTransparent(), ParentFunction->isSerialized(),
+          IsNotDynamic, 0, ParentFunction->isThunk(),
+          ParentFunction->getClassSubclassScope());
       // Increment the ref count for the inlined function, so it doesn't
       // get deleted before we can emit abstract debug info for it.
       if (!ParentFunction->isZombie()) {
@@ -357,7 +370,7 @@ protected:
         // If the function was newly created with an empty body mark it as
         // undead.
         if (ParentFunction->empty()) {
-          M.eraseFunction(ParentFunction);
+          FuncBuilder.eraseFunction(ParentFunction);
           ParentFunction->setGenericEnvironment(OriginalEnvironment);
         }
       }
@@ -375,7 +388,10 @@ protected:
   SILFunction &Original;
   /// True, if used for inlining.
   bool Inlining;
-  };
+  // Generic specialization can create noreturn applications that where
+  // previously not identifiable as such.
+  SmallVector<ApplyInst *, 16> noReturnApplies;
+};
 
 } // end namespace swift
 

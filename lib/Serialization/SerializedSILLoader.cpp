@@ -16,20 +16,21 @@
 #include "swift/Serialization/ModuleFile.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/AST/ASTMangler.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
 
-SerializedSILLoader::SerializedSILLoader(ASTContext &Ctx,
-                                         SILModule *SILMod,
-                                         Callback *callback) {
+SerializedSILLoader::SerializedSILLoader(
+    ASTContext &Ctx, SILModule *SILMod,
+    DeserializationNotificationHandlerSet *callbacks) {
 
   // Get a list of SerializedModules from ASTContext.
   // FIXME: Iterating over LoadedModules is not a good way to do this.
   for (auto &Entry : Ctx.LoadedModules) {
     for (auto File : Entry.second->getFiles()) {
       if (auto LoadedAST = dyn_cast<SerializedASTFile>(File)) {
-        auto Des = new SILDeserializer(&LoadedAST->File, *SILMod, callback);
+        auto Des = new SILDeserializer(&LoadedAST->File, *SILMod, callbacks);
 #ifndef NDEBUG
         SILMod->verify();
 #endif
@@ -100,9 +101,12 @@ bool SerializedSILLoader::hasSILFunction(StringRef Name,
 }
 
 
-SILVTable *SerializedSILLoader::lookupVTable(Identifier Name) {
+SILVTable *SerializedSILLoader::lookupVTable(const ClassDecl *C) {
+  Mangle::ASTMangler mangler;
+  std::string mangledClassName = mangler.mangleNominalType(C);
+
   for (auto &Des : LoadedSILSections) {
-    if (auto VT = Des->lookupVTable(Name))
+    if (auto VT = Des->lookupVTable(mangledClassName))
       return VT;
   }
   return nullptr;
@@ -181,5 +185,3 @@ void SerializedSILLoader::getAllProperties() {
     Des->getAllProperties();
 }
 
-// Anchor the SerializedSILLoader v-table.
-void SerializedSILLoader::Callback::_anchor() {}

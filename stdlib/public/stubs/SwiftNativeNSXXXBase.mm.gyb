@@ -45,13 +45,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-extern "C" CFHashCode CFStringHashCString(const uint8_t *bytes, CFIndex len);
-
 using namespace swift;
 
-% for Class in ('Array', 'Dictionary', 'Set', 'String', 'Enumerator', 'Data', 'IndexSet'):
+// NOTE: older runtimes called these _SwiftNativeNSXXXBase. The two must
+// coexist, so these were renamed. The old names must not be used in the new
+// runtime.
+% for Class in ('Array', 'Dictionary', 'Set', 'String', 'Enumerator'):
 SWIFT_RUNTIME_STDLIB_API
-@interface _SwiftNativeNS${Class}Base : NS${Class}
+@interface __SwiftNativeNS${Class}Base : NS${Class}
 {
  @private
   SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS;
@@ -59,8 +60,11 @@ SWIFT_RUNTIME_STDLIB_API
 @end
 
 
-@implementation _SwiftNativeNS${Class}Base
+@implementation __SwiftNativeNS${Class}Base
 
+- (id)initWithCoder: (NSCoder *)coder {
+  return [super init];
+}
 - (id)retain {
   auto SELF = reinterpret_cast<HeapObject *>(self);
   swift_retain(SELF);
@@ -92,6 +96,10 @@ SWIFT_RUNTIME_STDLIB_API
   return swift_tryRetain(reinterpret_cast<HeapObject*>(self)) != nullptr;
 }
 
++ (BOOL)automaticallyNotifiesObserversForKey:(NSString *)key {
+  return NO;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-missing-super-calls"
 - (void)dealloc {
@@ -102,7 +110,7 @@ SWIFT_RUNTIME_STDLIB_API
 @end
 % end
 
-SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_SPI
 bool
 swift_stdlib_NSObject_isEqual(NSObject *lhs,
                               NSObject *rhs) {
@@ -127,14 +135,6 @@ swift_stdlib_compareNSStringDeterministicUnicodeCollationPtr(void *Lhs,
   // 'kCFCompareNonliteral' actually means "normalize to NFD".
   int Result = CFStringCompare((__bridge CFStringRef)lhs,
                                (__bridge CFStringRef)rhs, kCFCompareNonliteral);
-  return Result;
-}
-
-SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
-size_t
-swift_stdlib_CFStringHashCString(const uint8_t *bytes, CFIndex len) {
-  CFHashCode Result = CFStringHashCString(bytes, len);
-
   return Result;
 }
 

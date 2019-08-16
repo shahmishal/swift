@@ -312,7 +312,7 @@ private:
     /// Advances the current instruction to the next instruction.
     void nextInst() {
       assert(CurrentInst);
-      if (isa<TerminatorInst>(CurrentInst)) {
+      if (CurrentInst->isTerminator()) {
         auto BlockIter = std::next(CurrentInst->getParent()->getIterator());
         if (BlockIter == F->end()) {
           CurrentInst = nullptr;
@@ -401,6 +401,8 @@ private:
   FunctionInfo removeFuncWithMostParams(FunctionInfos &FInfos);
 
   bool deriveParams(ParamInfos &Params, FunctionInfos &FInfos);
+
+  bool numOperandsDiffer(FunctionInfos &FInfos);
 
   bool constsDiffer(const FunctionInfos &FInfos, unsigned OpIdx);
 
@@ -513,6 +515,17 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
   return true;
 }
 
+/// Returns true if functions containing calls to \p F may be merged together.
+static bool mayMergeCallsToFunction(Function &F) {
+  StringRef Name = F.getName();
+
+  // Calls to dtrace probes must generate unique patchpoints.
+  if (Name.startswith("__dtrace"))
+    return false;
+
+  return true;
+}
+
 /// Returns true if function \p F is eligible for merging.
 static bool isEligibleFunction(Function *F) {
   if (F->isDeclaration())
@@ -533,6 +546,8 @@ static bool isEligibleFunction(Function *F) {
     for (Instruction &I : BB) {
       if (CallSite CS = CallSite(&I)) {
         Function *Callee = CS.getCalledFunction();
+        if (Callee && !mayMergeCallsToFunction(*Callee))
+          return false;
         if (!Callee || !Callee->isIntrinsic()) {
           Benefit += 5;
           continue;
@@ -763,6 +778,20 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   // Iterate over all instructions synchronously in all functions.
   do {
     if (isEligibleForConstantSharing(FirstFI.CurrentInst)) {
+
+      // Here we handle a rare corner case which needs to be explained:
+      // Usually the number of operands match, because otherwise the functions
+      // in FInfos would not be in the same equivalence class. There is only one
+      // exception to that: If the current instruction is a call to a function,
+      // which was merged in the previous iteration (in tryMergeEquivalenceClass)
+      // then the call could be replaced and has more arguments than the
+      // original call.
+      if (numOperandsDiffer(FInfos)) {
+        assert(isa<CallInst>(FirstFI.CurrentInst) &&
+               "only calls are expected to differ in number of operands");
+        return false;
+      }
+
       for (unsigned OpIdx = 0, NumOps = FirstFI.CurrentInst->getNumOperands();
            OpIdx != NumOps; ++OpIdx) {
 
@@ -782,6 +811,16 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   } while (FirstFI.CurrentInst);
 
   return true;
+}
+
+/// Returns true if the number of operands of the current instruction differs.
+bool SwiftMergeFunctions::numOperandsDiffer(FunctionInfos &FInfos) {
+  unsigned numOps = FInfos[0].CurrentInst->getNumOperands();
+  for (const FunctionInfo &FI : ArrayRef<FunctionInfo>(FInfos).drop_front(1)) {
+    if (FI.CurrentInst->getNumOperands() != numOps)
+      return true;
+  }
+  return false;
 }
 
 /// Returns true if the \p OpIdx's constant operand in the current instruction

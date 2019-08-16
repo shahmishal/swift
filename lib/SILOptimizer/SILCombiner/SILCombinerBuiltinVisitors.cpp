@@ -161,6 +161,18 @@ SILInstruction *SILCombiner::optimizeBuiltinZextOrBitCast(BuiltinInst *I) {
     replaceInstUsesWith(*I, NI);
     return eraseInstFromFunction(*I);
   }
+  // Optimize a sequence of conversion of an builtin integer to and from
+  // BridgeObject. This sequence appears in the String implementation.
+  if (auto *BO2W = dyn_cast<BridgeObjectToWordInst>(Op)) {
+    if (auto *V2BO = dyn_cast<ValueToBridgeObjectInst>(BO2W->getOperand())) {
+      if (auto *SI = dyn_cast<StructInst>(V2BO->getOperand())) {
+        if (SI->getNumOperands() == 1 && SI->getOperand(0)->getType() == I->getType()) {
+          replaceInstUsesWith(*I, SI->getOperand(0));
+          return eraseInstFromFunction(*I);
+        }
+      }
+    }
+  }
   return nullptr;
 }
 
@@ -251,29 +263,27 @@ matchSizeOfMultiplication(SILValue I, MetatypeInst *RequiredType,
 
   SILValue Dist;
   MetatypeInst *StrideType;
-  if (match(
-          Res->getOperand(1),
-          m_ApplyInst(
-              BuiltinValueKind::TruncOrBitCast,
-              m_TupleExtractInst(
-                  m_ApplyInst(
-                      BuiltinValueKind::SMulOver, m_SILValue(Dist),
-                      m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
-                                  m_ApplyInst(BuiltinValueKind::Strideof,
-                                              m_MetatypeInst(StrideType)))),
-                  0))) ||
-      match(
-          Res->getOperand(1),
-          m_ApplyInst(
-              BuiltinValueKind::TruncOrBitCast,
-              m_TupleExtractInst(
-                  m_ApplyInst(
-                      BuiltinValueKind::SMulOver,
-                      m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
-                                  m_ApplyInst(BuiltinValueKind::Strideof,
-                                              m_MetatypeInst(StrideType))),
-                      m_SILValue(Dist)),
-                  0)))) {
+  if (match(Res->getOperand(1),
+            m_ApplyInst(
+                BuiltinValueKind::TruncOrBitCast,
+                m_TupleExtractOperation(
+                    m_ApplyInst(
+                        BuiltinValueKind::SMulOver, m_SILValue(Dist),
+                        m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
+                                    m_ApplyInst(BuiltinValueKind::Strideof,
+                                                m_MetatypeInst(StrideType)))),
+                    0))) ||
+      match(Res->getOperand(1),
+            m_ApplyInst(
+                BuiltinValueKind::TruncOrBitCast,
+                m_TupleExtractOperation(
+                    m_ApplyInst(
+                        BuiltinValueKind::SMulOver,
+                        m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
+                                    m_ApplyInst(BuiltinValueKind::Strideof,
+                                                m_MetatypeInst(StrideType))),
+                        m_SILValue(Dist)),
+                    0)))) {
     if (StrideType != RequiredType)
       return nullptr;
     TruncOrBitCast = cast<BuiltinInst>(Res->getOperand(1));
@@ -294,12 +304,13 @@ static SILValue createIndexAddrFrom(IndexRawPointerInst *I,
                                     SILType RawPointerTy,
                                     SILBuilder &Builder) {
   Builder.setCurrentDebugScope(I->getDebugScope());
-  SILType InstanceType =
-    Metatype->getType().getMetatypeInstanceType(I->getModule());
+
+  CanType InstanceType =
+    Metatype->getType().castTo<MetatypeType>().getInstanceType();
 
   // index_raw_pointer's address type is currently always strict.
   auto *NewPTAI = Builder.createPointerToAddress(
-    I->getLoc(), Ptr, InstanceType.getAddressType(),
+    I->getLoc(), Ptr, SILType::getPrimitiveAddressType(InstanceType),
     /*isStrict*/ true, /*isInvariant*/ false);
 
   auto *DistanceAsWord =
@@ -602,13 +613,22 @@ SILInstruction *SILCombiner::visitBuiltinInst(BuiltinInst *I) {
     // Check if the element type is a trivial type.
     if (Substs.getReplacementTypes().size() == 1) {
       Type ElemType = Substs.getReplacementTypes()[0];
-      auto &SILElemTy = I->getModule().Types.getTypeLowering(ElemType);
+      auto &SILElemTy = I->getFunction()->getTypeLowering(ElemType);
       // Destroying an array of trivial types is a no-op.
       if (SILElemTy.isTrivial())
         return eraseInstFromFunction(*I);
     }
     break;
   }
+  case BuiltinValueKind::CondFailMessage:
+    if (auto *SLI = dyn_cast<StringLiteralInst>(I->getOperand(1))) {
+      if (SLI->getEncoding() == StringLiteralInst::Encoding::UTF8) {
+        Builder.createCondFail(I->getLoc(), I->getOperand(0), SLI->getValue());
+        eraseInstFromFunction(*I);
+        return nullptr;
+      }
+    }
+    break;
   default:
     break;
   }

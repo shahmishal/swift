@@ -34,6 +34,7 @@ class SemaAnnotator : public ASTWalker {
   SmallVector<ConstructorRefCallExpr *, 2> CtorRefs;
   SmallVector<ExtensionDecl *, 2> ExtDecls;
   llvm::SmallDenseMap<OpaqueValueExpr *, Expr *, 4> OpaqueValueMap;
+  llvm::SmallPtrSet<Expr *, 16> ExprsToSkip;
   bool Cancelled = false;
   Optional<AccessKind> OpAccess;
 
@@ -44,6 +45,10 @@ public:
   bool isDone() const { return Cancelled; }
 
 private:
+
+  // FIXME: Remove this
+  bool shouldWalkAccessorsTheOldWay() override { return true; }
+
   bool shouldWalkIntoGenericParams() override {
     return SEWalker.shouldWalkIntoGenericParams();
   }
@@ -61,6 +66,7 @@ private:
   std::pair<bool, Pattern *> walkToPatternPre(Pattern *P) override;
 
   bool handleImports(ImportDecl *Import);
+  bool handleCustomAttributes(Decl *D);
   bool passModulePathElements(ArrayRef<ImportDecl::AccessPathElement> Path,
                               const clang::Module *ClangMod);
 
@@ -70,8 +76,7 @@ private:
   bool passReference(ModuleEntity Mod, std::pair<Identifier, SourceLoc> IdLoc);
 
   bool passSubscriptReference(ValueDecl *D, SourceLoc Loc,
-                              Optional<AccessKind> AccKind,
-                              bool IsOpenBracket);
+                              ReferenceMetaData Data, bool IsOpenBracket);
 
   bool passCallArgNames(Expr *Fn, TupleExpr *TupleE);
 
@@ -95,6 +100,11 @@ bool SemaAnnotator::walkToDeclPre(Decl *D) {
   bool ShouldVisitChildren;
   if (shouldIgnore(D, ShouldVisitChildren))
     return ShouldVisitChildren;
+
+  if (!handleCustomAttributes(D)) {
+    Cancelled = true;
+    return false;
+  }
 
   SourceLoc Loc = D->getLoc();
   unsigned NameLen = 0;
@@ -176,25 +186,6 @@ bool SemaAnnotator::walkToDeclPost(Decl *D) {
   if (shouldIgnore(D, ShouldVisitChildren))
     return true;
 
-  // FIXME: rdar://17671977 the initializer for a lazy property has already
-  // been moved into its implicit getter.
-  if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
-    if (auto *VD = PBD->getSingleVar()) {
-      if (VD->getAttrs().hasAttribute<LazyAttr>()) {
-        if (auto *Get = VD->getGetter()) {
-          assert((Get->isImplicit() || Get->isInvalid())
-            && "lazy var getter must be either implicitly computed or invalid");
-
-          // Note that an implicit getter may not have the body synthesized
-          // in case the owning PatternBindingDecl is invalid.
-          if (auto *Body = Get->getBody()) {
-            Body->walk(*this);
-          }
-        }
-      }
-    }
-  }
-
   if (isa<ExtensionDecl>(D)) {
     assert(ExtDecls.back() == D);
     ExtDecls.pop_back();
@@ -253,6 +244,9 @@ std::pair<bool, Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
   if (isDone())
     return { false, nullptr };
 
+  if (ExprsToSkip.count(E) != 0)
+    return { false, E };
+
   if (!SEWalker.walkToExprPre(E))
     return { false, E };
 
@@ -265,6 +259,8 @@ std::pair<bool, Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
       !isa<MakeTemporarilyEscapableExpr>(E) &&
       !isa<CollectionUpcastConversionExpr>(E) &&
       !isa<OpaqueValueExpr>(E) &&
+      !isa<SubscriptExpr>(E) &&
+      !isa<KeyPathExpr>(E) &&
       E->isImplicit())
     return { true, E };
 
@@ -326,8 +322,11 @@ std::pair<bool, Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
     if (SE->hasDecl())
       SubscrD = SE->getDecl().getDecl();
 
+    ReferenceMetaData data(SemaReferenceKind::SubscriptRef, OpAccess,
+                           SE->isImplicit());
+
     if (SubscrD) {
-      if (!passSubscriptReference(SubscrD, E->getLoc(), OpAccess, true))
+      if (!passSubscriptReference(SubscrD, E->getLoc(), data, true))
         return { false, nullptr };
     }
 
@@ -335,7 +334,7 @@ std::pair<bool, Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
       return { false, nullptr };
 
     if (SubscrD) {
-      if (!passSubscriptReference(SubscrD, E->getEndLoc(), OpAccess, false))
+      if (!passSubscriptReference(SubscrD, E->getEndLoc(), data, false))
         return { false, nullptr };
     }
 
@@ -361,12 +360,14 @@ std::pair<bool, Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
         break;
       }
 
+      case KeyPathExpr::Component::Kind::TupleElement:
       case KeyPathExpr::Component::Kind::Invalid:
       case KeyPathExpr::Component::Kind::UnresolvedProperty:
       case KeyPathExpr::Component::Kind::UnresolvedSubscript:
       case KeyPathExpr::Component::Kind::OptionalChain:
       case KeyPathExpr::Component::Kind::OptionalWrap:
       case KeyPathExpr::Component::Kind::OptionalForce:
+      case KeyPathExpr::Component::Kind::Identity:
         break;
       }
     }
@@ -535,6 +536,41 @@ std::pair<bool, Pattern *> SemaAnnotator::walkToPatternPre(Pattern *P) {
   return { false, P };
 }
 
+bool SemaAnnotator::handleCustomAttributes(Decl *D) {
+  // CustomAttrs of non-param VarDecls are handled when this method is called
+  // on their containing PatternBindingDecls (see below).
+  if (isa<VarDecl>(D) && !isa<ParamDecl>(D))
+    return true;
+
+  if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
+    if (auto *SingleVar = PBD->getSingleVar()) {
+      D = SingleVar;
+    } else {
+      return true;
+    }
+  }
+  for (auto *customAttr : D->getAttrs().getAttributes<CustomAttr, true>()) {
+    if (auto *Repr = customAttr->getTypeLoc().getTypeRepr()) {
+      if (!Repr->walk(*this))
+        return false;
+    }
+    if (auto *SemaInit = customAttr->getSemanticInit()) {
+      if (!SemaInit->isImplicit()) {
+        assert(customAttr->getArg());
+        if (!SemaInit->walk(*this))
+          return false;
+        // Don't walk this again via the associated PatternBindingDecl's
+        // initializer
+        ExprsToSkip.insert(SemaInit);
+      }
+    } else if (auto *Arg = customAttr->getArg()) {
+      if (!Arg->walk(*this))
+        return false;
+    }
+  }
+  return true;
+}
+
 bool SemaAnnotator::handleImports(ImportDecl *Import) {
   auto Mod = Import->getModule();
   if (!Mod)
@@ -575,14 +611,14 @@ bool SemaAnnotator::passModulePathElements(
 }
 
 bool SemaAnnotator::passSubscriptReference(ValueDecl *D, SourceLoc Loc,
-                                           Optional<AccessKind> AccKind,
+                                           ReferenceMetaData Data,
                                            bool IsOpenBracket) {
   CharSourceRange Range = Loc.isValid()
                         ? CharSourceRange(Loc, 1)
                         : CharSourceRange();
 
-  bool Continue = SEWalker.visitSubscriptReference(D, Range, AccKind,
-                                                   IsOpenBracket);
+  bool Continue =
+      SEWalker.visitSubscriptReference(D, Range, Data, IsOpenBracket);
   if (!Continue)
     Cancelled = true;
   return Continue;
@@ -725,13 +761,14 @@ bool SourceEntityWalker::visitDeclReference(ValueDecl *D, CharSourceRange Range,
 
 bool SourceEntityWalker::visitSubscriptReference(ValueDecl *D,
                                                  CharSourceRange Range,
-                                                 Optional<AccessKind> AccKind,
+                                                 ReferenceMetaData Data,
                                                  bool IsOpenBracket) {
   // Most of the clients treat subscript reference the same way as a
   // regular reference when called on the open bracket and
   // ignore the closing one.
-  return IsOpenBracket ? visitDeclReference(D, Range, nullptr, nullptr, Type(),
-    ReferenceMetaData(SemaReferenceKind::SubscriptRef, AccKind)) : true;
+  return IsOpenBracket
+             ? visitDeclReference(D, Range, nullptr, nullptr, Type(), Data)
+             : true;
 }
 
 bool SourceEntityWalker::visitCallArgName(Identifier Name,

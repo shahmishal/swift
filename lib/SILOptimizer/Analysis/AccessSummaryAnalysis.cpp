@@ -32,7 +32,7 @@ void AccessSummaryAnalysis::processFunction(FunctionInfo *info,
     FunctionSummary &functionSummary = info->getSummary();
     ArgumentSummary &argSummary =
         functionSummary.getAccessForArgument(index);
-    index++;
+    ++index;
 
     auto *functionArg = cast<SILFunctionArgument>(arg);
     // Only summarize @inout_aliasable arguments.
@@ -137,6 +137,9 @@ static bool hasExpectedUsesOfNoEscapePartialApply(Operand *partialApplyUse) {
   case SILInstructionKind::ApplyInst:
   case SILInstructionKind::TryApplyInst:
     return true;
+  // partial_apply [stack] is terminated by a dealloc_stack.
+  case SILInstructionKind::DeallocStackInst:
+    return true;
 
   case SILInstructionKind::ConvertFunctionInst:
     return llvm::all_of(cast<ConvertFunctionInst>(user)->getUses(),
@@ -227,8 +230,8 @@ void AccessSummaryAnalysis::processPartialApply(FunctionInfo *callerInfo,
 
   // Make sure the partial_apply is not calling the result of another
   // partial_apply.
-  assert(isa<FunctionRefInst>(apply->getCallee()) &&
-         "Noescape partial apply of non-functionref?");
+  assert(isa<FunctionRefBaseInst>(apply->getCallee())
+         && "Noescape partial apply of non-functionref?");
 
   assert(llvm::all_of(apply->getUses(),
                       hasExpectedUsesOfNoEscapePartialApply) &&
@@ -423,7 +426,7 @@ AccessSummaryAnalysis::ArgumentSummary::getDescription(SILType BaseType,
       os << ", ";
     }
     os << subAccess.getDescription(BaseType, M);
-    index++;
+    ++index;
   }
   os << "]";
 
@@ -466,8 +469,7 @@ AccessSummaryAnalysis::getOrCreateSummary(SILFunction *fn) {
 void AccessSummaryAnalysis::AccessSummaryAnalysis::invalidate() {
   FunctionInfos.clear();
   Allocator.DestroyAll();
-  delete SubPathTrie;
-  SubPathTrie = new IndexTrieNode();
+  SubPathTrie.reset(new IndexTrieNode());
 }
 
 void AccessSummaryAnalysis::invalidate(SILFunction *F, InvalidationKind K) {
@@ -525,7 +527,7 @@ getSingleAddressProjectionUser(SingleValueInstruction *I) {
 
 const IndexTrieNode *
 AccessSummaryAnalysis::findSubPathAccessed(BeginAccessInst *BAI) {
-  IndexTrieNode *SubPath = SubPathTrie;
+  IndexTrieNode *SubPath = getSubPathTrieRoot();
 
   // For each single-user projection of BAI, construct or get a node
   // from the trie representing the index of the field or tuple element
@@ -566,9 +568,7 @@ std::string AccessSummaryAnalysis::getSubPathDescription(
     os << ".";
 
     if (StructDecl *D = containingType.getStructOrBoundGenericStruct()) {
-      auto iter = D->getStoredProperties().begin();
-      std::advance(iter, index);
-      VarDecl *var = *iter;
+      VarDecl *var = D->getStoredProperties()[index];
       os << var->getBaseName();
       containingType = containingType.getFieldType(var, M);
       continue;
@@ -595,7 +595,7 @@ static unsigned subPathLength(const IndexTrieNode *subPath) {
 
   const IndexTrieNode *iter = subPath;
   while (iter) {
-    length++;
+    ++length;
     iter = iter->getParent();
   }
 
@@ -629,7 +629,7 @@ void AccessSummaryAnalysis::FunctionSummary::print(raw_ostream &os,
   unsigned argCount = getArgumentCount();
   os << "(";
 
-  for (unsigned i = 0; i < argCount; i++) {
+  for (unsigned i = 0; i < argCount; ++i) {
     if (i > 0) {
       os << ",  ";
     }

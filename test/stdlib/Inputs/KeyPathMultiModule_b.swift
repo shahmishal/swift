@@ -35,6 +35,18 @@ public struct A {
     get { return 0 }
     set { }
   }
+
+  public internal(set) var w: Int {
+    get { return 0 }
+    set { }
+  }
+  public fileprivate(set) var v: Int {
+    get { return 0 }
+    set { }
+  }
+
+
+  public let immutable: Int = 1738
 }
 
 public struct B<U> {
@@ -86,6 +98,18 @@ public func A_y_keypath() -> KeyPath<A, Int> {
 
 public func A_z_keypath() -> KeyPath<A, Int> {
   return \A.z
+}
+
+public func A_w_keypath() -> KeyPath<A, Int> {
+  return \A.w
+}
+
+public func A_v_keypath() -> KeyPath<A, Int> {
+  return \A.v
+}
+
+public func A_immutable_keypath() -> KeyPath<A, Int> {
+  return \A.immutable
 }
 
 public func A_subscript_withGeneric_keypath<T: Hashable>(index: T)
@@ -197,6 +221,8 @@ open class ResilientRoot {
   open var storedA = "a"
   open var storedB = "b"
 
+  public let storedLet = "c"
+
   open var virtual: String {
     get { return "foo" }
     set { }
@@ -236,6 +262,9 @@ public func ResilientRoot_storedA_keypath() -> KeyPath<ResilientRoot, String> {
 }
 public func ResilientRoot_storedB_keypath() -> KeyPath<ResilientRoot, String> {
   return \ResilientRoot.storedB
+}
+public func ResilientRoot_storedLet_keypath() -> KeyPath<ResilientRoot, String> {
+  return \ResilientRoot.storedLet
 }
 public func ResilientRoot_virtual_keypath() -> KeyPath<ResilientRoot, String> {
   return \ResilientRoot.virtual

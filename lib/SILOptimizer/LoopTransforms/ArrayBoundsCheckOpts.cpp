@@ -87,42 +87,6 @@ static SILValue getArrayStructPointer(ArrayCallKind K, SILValue Array) {
   return Array;
 }
 
-/// Check whether the store is to the address obtained from a getElementAddress
-/// semantic call.
-///  %40 = function_ref @getElementAddress
-///  %42 = apply %40(%28, %37)
-///  %43 = struct_extract %42
-///  %44 = pointer_to_address strict %43
-///  store %1 to %44 : $*Int
-static bool isArrayEltStore(StoreInst *SI) {
-  // Strip the MarkDependenceInst (new array implementation) where the above
-  // pattern looks like the following.
-  // %40 = function_ref @getElementAddress
-  // %41 = apply %40(%21, %35)
-  // %42 = struct_element_addr %0 : $*Array<Int>, #Array._buffer
-  // %43 = struct_element_addr %42 : $*_ArrayBuffer<Int>, #_ArrayBuffer._storage
-  // %44 = struct_element_addr %43 : $*_BridgeStorage
-  // %45 = load %44 : $*Builtin.BridgeObject
-  // %46 = unchecked_ref_cast %45 : $... to $_ContiguousArrayStorageBase
-  // %47 = unchecked_ref_cast %46 : $... to $Builtin.NativeObject
-  // %48 = struct_extract %41 : $..., #UnsafeMutablePointer._rawValue
-  // %49 = pointer_to_address %48 : $Builtin.RawPointer to strict $*Int
-  // %50 = mark_dependence %49 : $*Int on %47 : $Builtin.NativeObject
-  // store %1 to %50 : $*Int
-  SILValue Dest = SI->getDest();
-  if (auto *MD = dyn_cast<MarkDependenceInst>(Dest))
-    Dest = MD->getOperand(0);
-
-  if (auto *PtrToAddr =
-          dyn_cast<PointerToAddressInst>(stripAddressProjections(Dest)))
-    if (auto *SEI = dyn_cast<StructExtractInst>(PtrToAddr->getOperand())) {
-      ArraySemanticsCall Call(SEI->getOperand());
-      if (Call && Call.getKind() == ArrayCallKind::kGetElementAddress)
-        return true;
-    }
-  return false;
-}
-
 static bool isReleaseSafeArrayReference(SILValue Ref,
                                         ArraySet &ReleaseSafeArrayReferences,
                                         RCIdentityFunctionInfo *RCIA) {
@@ -185,7 +149,7 @@ mayChangeArraySize(SILInstruction *I, ArrayCallKind &Kind, SILValue &Array,
   // stored in a runtime allocated object sub field of an alloca.
   if (auto *SI = dyn_cast<StoreInst>(I)) {
     auto Ptr = SI->getDest();
-    return isa<AllocStackInst>(Ptr) || isArrayEltStore(SI)
+    return isa<AllocStackInst>(Ptr) || isAddressOfArrayElement(SI->getDest())
                ? ArrayBoundsEffect::kNone
                : ArrayBoundsEffect::kMayChangeAny;
   }
@@ -494,7 +458,7 @@ static CondFailInst *hasCondFailUse(SILValue V) {
 /// a cond_fail on the second result.
 static CondFailInst *isOverflowChecked(BuiltinInst *AI) {
   for (auto *Op : AI->getUses()) {
-    if (!match(Op->getUser(), m_TupleExtractInst(m_ValueBase(), 1)))
+    if (!match(Op->getUser(), m_TupleExtractOperation(m_ValueBase(), 1)))
       continue;
 
     TupleExtractInst *TEI = cast<TupleExtractInst>(Op->getUser());
@@ -510,11 +474,10 @@ static bool isSignedLessEqual(SILValue Start, SILValue End, SILBasicBlock &BB) {
   // If we have an inclusive range "low...up" the loop exit count will be
   // "up + 1" but the overflow check is on "up".
   SILValue PreInclusiveEnd;
-  if (!match(
-          End,
-          m_TupleExtractInst(m_ApplyInst(BuiltinValueKind::SAddOver,
-                                         m_SILValue(PreInclusiveEnd), m_One()),
-                             0)))
+  if (!match(End, m_TupleExtractOperation(
+                      m_ApplyInst(BuiltinValueKind::SAddOver,
+                                  m_SILValue(PreInclusiveEnd), m_One()),
+                      0)))
     PreInclusiveEnd = SILValue();
 
   bool IsPreInclusiveEndLEQ = false;
@@ -748,7 +711,7 @@ struct InductionInfo {
     auto ResultTy = SILType::getBuiltinIntegerType(1, Builder.getASTContext());
     auto *CmpSGE = Builder.createBuiltinBinaryFunction(
         Loc, "cmp_sge", Start->getType(), ResultTy, {Start, End});
-    Builder.createCondFail(Loc, CmpSGE);
+    Builder.createCondFail(Loc, CmpSGE, "loop induction variable overflowed");
     IsOverflowCheckInserted = true;
 
     // We can now remove the cond fail on the increment the above comparison
@@ -847,11 +810,11 @@ private:
     // Look for a compare of induction variable + 1.
     // TODO: obviously we need to handle many more patterns.
     if (!match(Cond, m_ApplyInst(BuiltinValueKind::ICMP_EQ,
-                                 m_TupleExtractInst(m_Specific(Inc), 0),
+                                 m_TupleExtractOperation(m_Specific(Inc), 0),
                                  m_SILValue(End))) &&
         !match(Cond,
                m_ApplyInst(BuiltinValueKind::ICMP_EQ, m_SILValue(End),
-                           m_TupleExtractInst(m_Specific(Inc), 0)))) {
+                           m_TupleExtractOperation(m_Specific(Inc), 0)))) {
       LLVM_DEBUG(llvm::dbgs() << " found no exit condition\n");
       return nullptr;
     }
@@ -1111,7 +1074,7 @@ static bool isComparisonKnownFalse(BuiltinInst *Builtin,
   // Iteration count + 1 < 0 (start)
   // Iteration count + 1 == 0 (start)
   auto MatchIndVarHeader = m_Specific(IndVar.HeaderVal);
-  auto MatchIncrementIndVar = m_TupleExtractInst(
+  auto MatchIncrementIndVar = m_TupleExtractOperation(
       m_ApplyInst(BuiltinValueKind::SAddOver, MatchIndVarHeader, m_One()), 0);
   auto MatchIndVarStart = m_Specific(IndVar.Start);
 
@@ -1324,6 +1287,9 @@ public:
 
     SILFunction *F = getFunction();
     assert(F);
+    // FIXME: Update for ownership.
+    if (F->hasOwnership())
+      return;
     SILLoopInfo *LI = LA->get(F);
     assert(LI);
     DominanceInfo *DT = DA->get(F);

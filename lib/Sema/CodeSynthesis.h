@@ -18,7 +18,6 @@
 #ifndef SWIFT_TYPECHECKING_CODESYNTHESIS_H
 #define SWIFT_TYPECHECKING_CODESYNTHESIS_H
 
-#include "TypeCheckObjC.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/LLVM.h"
@@ -34,6 +33,7 @@ class ConstructorDecl;
 class FuncDecl;
 class GenericParamList;
 class NominalTypeDecl;
+class ParamDecl;
 class Type;
 class ValueDecl;
 class VarDecl;
@@ -42,121 +42,26 @@ class TypeChecker;
 
 class ObjCReason;
 
-/// A function which needs to have its body synthesized.
-///
-/// This class exists in expectation that someone will need to add more
-/// information to it.
-class SynthesizedFunction {
-public:
-  enum Kind {
-    Getter,
-    Setter,
-    MaterializeForSet,
-    LazyGetter,
-    LazySetter,
-  };
+enum class SelfAccessorKind {
+  /// We're building a derived accessor on top of whatever this
+  /// class provides.
+  Peer,
 
-private:
-  FuncDecl *Fn;
-  Kind K;
-
-  using Members = ExternalUnionMembers<void, VarDecl*>;
-  static Members::Index getIndexForKind(Kind kind) {
-    switch (kind) {
-    case Kind::Getter:
-    case Kind::Setter:
-    case Kind::MaterializeForSet:
-      return Members::indexOf<void>();
-    case Kind::LazyGetter:
-    case Kind::LazySetter:
-      return Members::indexOf<VarDecl*>();
-    }
-    llvm_unreachable("bad kind");
-  };
-  ExternalUnion<Kind, Members, getIndexForKind> Extra;
-  static_assert(decltype(Extra)::union_is_trivially_copyable,
-                "expected all members to be trivial");
-
-public:
-  SynthesizedFunction(FuncDecl *fn, Kind kind) : Fn(fn), K(kind) {
-    assert(getIndexForKind(kind) == Members::indexOf<void>() &&
-           "this storage kind requires extra data");
-  }
-
-  SynthesizedFunction(FuncDecl *fn, Kind kind, VarDecl *var) : Fn(fn), K(kind) {
-    Extra.emplace<VarDecl*>(K, var);
-  }
-
-  FuncDecl *getDecl() const { return Fn; }
-  Kind getKind() const { return K; }
-
-  VarDecl *getLazyTargetVariable() const { return Extra.get<VarDecl*>(K); }
+  /// We're building a setter or something around an underlying
+  /// implementation, which might be storage or inherited from a
+  /// superclass.
+  Super,
 };
 
-// These are implemented in TypeCheckDecl.cpp.
-void makeFinal(ASTContext &ctx, ValueDecl *D);
+Expr *buildSelfReference(VarDecl *selfDecl,
+                         SelfAccessorKind selfAccessorKind,
+                         bool isLValue,
+                         ASTContext &ctx);
 
-// Implemented in TypeCheckerOverride.cpp
-bool checkOverrides(ValueDecl *decl);
-
-// These are implemented in CodeSynthesis.cpp.
-void maybeAddMaterializeForSet(AbstractStorageDecl *storage,
-                               TypeChecker &TC);
-void maybeAddAccessorsToStorage(TypeChecker &TC, AbstractStorageDecl *storage);
-
-void triggerAccessorSynthesis(TypeChecker &TC, AbstractStorageDecl *storage);
-
-/// \brief Describes the kind of implicit constructor that will be
-/// generated.
-enum class ImplicitConstructorKind {
-  /// \brief The default constructor, which default-initializes each
-  /// of the instance variables.
-  Default,
-  /// \brief The memberwise constructor, which initializes each of
-  /// the instance variables from a parameter of the same type and
-  /// name.
-  Memberwise
-};
-
-/// \brief Create an implicit struct or class constructor.
-///
-/// \param decl The struct or class for which a constructor will be created.
-/// \param ICK The kind of implicit constructor to create.
-///
-/// \returns The newly-created constructor, which has already been type-checked
-/// (but has not been added to the containing struct or class).
-ConstructorDecl *createImplicitConstructor(TypeChecker &tc,
-                                           NominalTypeDecl *decl,
-                                           ImplicitConstructorKind ICK);
-
-/// The kind of designated initializer to synthesize.
-enum class DesignatedInitKind {
-  /// A stub initializer, which is not visible to name lookup and
-  /// merely aborts at runtime.
-  Stub,
-
-  /// An initializer that simply chains to the corresponding
-  /// superclass initializer.
-  Chaining
-};
-
-/// Create a new initializer that overrides the given designated
-/// initializer.
-///
-/// \param classDecl The subclass in which the new initializer will
-/// be declared.
-///
-/// \param superclassCtor The superclass initializer for which this
-/// routine will create an override.
-///
-/// \param kind The kind of initializer to synthesize.
-///
-/// \returns the newly-created initializer that overrides \p
-/// superclassCtor.
-ConstructorDecl *createDesignatedInitOverride(TypeChecker &TC,
-                                              ClassDecl *classDecl,
-                                              ConstructorDecl *superclassCtor,
-                                              DesignatedInitKind kind);
+/// Build an expression that evaluates the specified parameter list as a tuple
+/// or paren expr, suitable for use in an apply expr.
+Expr *buildArgumentForwardingExpr(ArrayRef<ParamDecl*> params,
+                                  ASTContext &ctx);
 
 } // end namespace swift
 

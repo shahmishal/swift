@@ -85,17 +85,13 @@ class NullEditorConsumer : public EditorConsumer {
     return SyntaxTreeTransferMode::Off;
   }
 
-  bool syntaxReuseInfoEnabled() override { return false; }
-
-  void
-  handleSyntaxReuseRegions(std::vector<SourceFileRange> ReuseRegions) override {
-  }
-
 public:
   bool needsSema = false;
 };
 
 struct TestCursorInfo {
+  // Empty if no error.
+  std::string Error;
   std::string Name;
   std::string Typename;
   std::string Filename;
@@ -128,7 +124,7 @@ public:
   }
 
   void addNotificationReceiver(DocumentUpdateNotificationReceiver Receiver) {
-    Ctx.getNotificationCenter().addDocumentUpdateNotificationReceiver(Receiver);
+    Ctx.getNotificationCenter()->addDocumentUpdateNotificationReceiver(Receiver);
   }
 
   void open(const char *DocName, StringRef Text,
@@ -136,7 +132,7 @@ public:
     auto Args = CArgs.hasValue() ? makeArgs(DocName, *CArgs)
                                  : std::vector<const char *>{};
     auto Buf = MemoryBuffer::getMemBufferCopy(Text, DocName);
-    getLang().editorOpen(DocName, Buf.get(), Consumer, Args);
+    getLang().editorOpen(DocName, Buf.get(), Consumer, Args, None);
   }
 
   void replaceText(StringRef DocName, unsigned Offset, unsigned Length,
@@ -151,8 +147,15 @@ public:
     Semaphore sema(0);
 
     TestCursorInfo TestInfo;
-    getLang().getCursorInfo(DocName, Offset, 0, false, false, Args,
-      [&](const CursorInfoData &Info) {
+    getLang().getCursorInfo(DocName, Offset, 0, false, false, Args, None,
+      [&](const RequestResult<CursorInfoData> &Result) {
+        assert(!Result.isCancelled());
+        if (Result.isError()) {
+          TestInfo.Error = Result.getError();
+          sema.signal();
+          return;
+        }
+        const CursorInfoData &Info = Result.value();
         TestInfo.Name = Info.Name;
         TestInfo.Typename = Info.TypeName;
         TestInfo.Filename = Info.Filename;

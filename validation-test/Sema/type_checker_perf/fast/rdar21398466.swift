@@ -1,5 +1,7 @@
-// RUN: %target-typecheck-verify-swift -solver-expression-time-threshold=1 -swift-version 4
-// REQUIRES: tools-release,no_asserts
+// RUN: %target-typecheck-verify-swift -solver-expression-time-threshold=1
+// REQUIRES: OS=macosx
+// REQUIRES: asserts
+// REQUIRES: rdar48061151
 
 // This problem is related to renaming,
 // as soon as `init(truncatingBitPattern:)` is changed

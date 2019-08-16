@@ -45,7 +45,7 @@ enum ArtificialKind : bool { RealValue = false, ArtificialValue = true };
 /// \c llvm::DebugLoc.
 class IRGenDebugInfo {
 public:
-  static IRGenDebugInfo *
+  static std::unique_ptr<IRGenDebugInfo>
   createIRGenDebugInfo(const IRGenOptions &Opts, ClangImporter &CI,
                        IRGenModule &IGM, llvm::Module &M,
                        StringRef MainOutputFilenameForDebugInfo);
@@ -58,6 +58,12 @@ public:
   /// Loc and the lexical scope DS.
   void setCurrentLoc(IRBuilder &Builder, const SILDebugScope *DS,
                      SILLocation Loc);
+
+  /// Replace the current debug location in \p Builder with the same location, but contained in an
+  /// inlined function which is named like \p failureMsg.
+  ///
+  /// This lets the debugger display the \p failureMsg as an inlined function frame.
+  void addFailureMessageToCurrentLoc(IRBuilder &Builder, StringRef failureMsg);
 
   void clearLoc(IRBuilder &Builder);
 
@@ -149,7 +155,7 @@ public:
 
   /// Emit debug metadata for type metadata (for generic types). So meta.
   void emitTypeMetadata(IRGenFunction &IGF, llvm::Value *Metadata,
-                        unsigned Depth, unsigned Index, StringRef AssocType);
+                        unsigned Depth, unsigned Index, StringRef Name);
 
   /// Return the DIBuilder.
   llvm::DIBuilder &getBuilder();

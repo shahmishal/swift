@@ -17,19 +17,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "ConstraintSystem.h"
-#include "GenericTypeResolver.h"
-#include "TypeChecker.h"
-#include "TypoCorrection.h"
 #include "MiscDiagnostics.h"
+#include "TypeChecker.h"
+#include "TypeCheckType.h"
+#include "TypoCorrection.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
+#include "swift/AST/ParameterList.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/PropertyWrappers.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckerDebugConsumer.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/Parse/Confusables.h"
 #include "swift/Parse/Lexer.h"
 #include "llvm/ADT/APInt.h"
@@ -71,14 +76,13 @@ void SavedTypeVariableBinding::restore() {
   typeVar->getImpl().ParentOrFixed = ParentOrFixed;
 }
 
-ArchetypeType *TypeVariableType::Implementation::getArchetype() const {
-  // Check whether we have a path that terminates at an archetype locator.
-  if (!locator || locator->getPath().empty() ||
-      locator->getPath().back().getKind() != ConstraintLocator::Archetype)
-    return nullptr;
-
-  // Retrieve the archetype.
-  return locator->getPath().back().getArchetype();
+GenericTypeParamType *
+TypeVariableType::Implementation::getGenericParameter() const {
+  // Check whether we have a path that terminates at a generic parameter
+  // locator.
+  return locator && locator->isForGenericParameter()
+             ? locator->getGenericParameter()
+             : nullptr;
 }
 
 // Only allow allocation of resolved overload set list items using the
@@ -96,13 +100,11 @@ void *operator new(size_t bytes, ConstraintSystem& cs,
 
 bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
                                       ArrayRef<TupleTypeElt> toTuple,
-                                      SmallVectorImpl<int> &sources,
-                                      SmallVectorImpl<unsigned> &variadicArgs) {
-  const int unassigned = -3;
+                                      SmallVectorImpl<unsigned> &sources) {
+  const unsigned unassigned = -1;
   
   SmallVector<bool, 4> consumed(fromTuple.size(), false);
   sources.clear();
-  variadicArgs.clear();
   sources.assign(toTuple.size(), unassigned);
 
   // Match up any named elements.
@@ -146,35 +148,14 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
     if (sources[i] != unassigned)
       continue;
 
-    const auto &elt2 = toTuple[i];
-
-    // Variadic tuple elements match the rest of the input elements.
-    if (elt2.isVararg()) {
-      // Collect the remaining (unnamed) inputs.
-      while (fromNext != fromLast) {
-        // Labeled elements can't be adopted into varargs even if
-        // they're non-mandatory.  There isn't a really strong reason
-        // for this, though.
-        if (fromTuple[fromNext].hasName())
-          return true;
-
-        variadicArgs.push_back(fromNext);
-        consumed[fromNext] = true;
-        skipToNextAvailableInput();
-      }
-      sources[i] = TupleShuffleExpr::Variadic;
-      
-      // Keep looking at subsequent arguments.  Non-variadic arguments may
-      // follow the variadic one.
-      continue;
-    }
-
     // If there aren't any more inputs, we are done.
     if (fromNext == fromLast) {
       return true;
     }
 
     // Otherwise, assign this input to the next output element.
+    const auto &elt2 = toTuple[i];
+    assert(!elt2.isVararg());
 
     // Fail if the input element is named and we're trying to match it with
     // something with a different label.
@@ -199,13 +180,16 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
 Expr *ConstraintLocatorBuilder::trySimplifyToExpr() const {
   SmallVector<LocatorPathElt, 4> pathBuffer;
   Expr *anchor = getLocatorParts(pathBuffer);
+  // Locators are not guaranteed to have an anchor
+  // if constraint system is used to verify generic
+  // requirements.
+  if (!anchor)
+    return nullptr;
+
   ArrayRef<LocatorPathElt> path = pathBuffer;
 
-  Expr *targetAnchor;
-  SmallVector<LocatorPathElt, 4> targetPathBuffer;
   SourceRange range;
-
-  simplifyLocator(anchor, path, targetAnchor, targetPathBuffer, range);
+  simplifyLocator(anchor, path, range);
   return (path.empty() ? anchor : nullptr);
 }
 
@@ -214,29 +198,12 @@ Expr *ConstraintLocatorBuilder::trySimplifyToExpr() const {
 //===----------------------------------------------------------------------===//
 
 static unsigned getNumArgs(ValueDecl *value) {
-  if (!isa<FuncDecl>(value)) return ~0U;
-
-  AnyFunctionType *fnTy = value->getInterfaceType()->castTo<AnyFunctionType>();
-  if (value->getDeclContext()->isTypeContext())
-    fnTy = fnTy->getResult()->castTo<AnyFunctionType>();
-
-  auto params = fnTy->getParams();
-  if (params.size() == 1) {
-    const auto &param = params.front();
-    if (param.hasLabel() || param.isVariadic())
-      return 1;
-
-    if (auto *tuple = param.getType()->getAs<TupleType>())
-      return tuple->getNumElements();
-  }
-
-  return params.size();
+  if (auto *func = dyn_cast<FuncDecl>(value))
+    return func->getParameters()->size();
+  return ~0U;
 }
 
 static bool matchesDeclRefKind(ValueDecl *value, DeclRefKind refKind) {
-  if (value->getInterfaceType()->hasError())
-    return true;
-
   switch (refKind) {
   // An ordinary reference doesn't ignore anything.
   case DeclRefKind::Ordinary:
@@ -586,6 +553,18 @@ resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *DC) {
     };
 
     if (!isConfused) {
+      if (Name == Context.Id_Self) {
+        if (DeclContext *typeContext = DC->getInnermostTypeContext()){
+          Type SelfType = typeContext->getSelfInterfaceType();
+
+          if (typeContext->getSelfClassDecl())
+            SelfType = DynamicSelfType::get(SelfType, Context);
+          SelfType = DC->mapTypeIntoContext(SelfType);
+          return new (Context) TypeExpr(TypeLoc(new (Context)
+                                                FixedTypeRepr(SelfType, Loc)));
+        }
+      }
+
       TypoCorrectionResults corrections(*this, Name, nameLoc);
       performTypoCorrection(DC, UDRE->getRefKind(), Type(),
                             lookupOptions, corrections);
@@ -755,8 +734,7 @@ resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *DC) {
       // conditional conformance for the type with the method in question
       // (NB. that type may not be the type associated with DC, for tested types
       // with static methods).
-      if (auto Proto = Value->getDeclContext()
-                           ->getAsProtocolOrProtocolExtensionContext()) {
+      if (auto Proto = Value->getDeclContext()->getSelfProtocolDecl()) {
         auto contextSelfType =
             BaseDC->getInnermostTypeContext()->getDeclaredInterfaceType();
         auto conformance = conformsToProtocol(
@@ -977,6 +955,107 @@ namespace {
     /// the type conforms to the expected literal protocol.
     Expr *simplifyTypeConstructionWithLiteralArg(Expr *E);
 
+    /// In Swift < 5, diagnose and correct invalid multi-argument or
+    /// argument-labeled interpolations.
+    void correctInterpolationIfStrange(InterpolatedStringLiteralExpr *ISLE) {
+      // These expressions are valid in Swift 5+.
+      if (TC.Context.isSwiftVersionAtLeast(5))
+        return;
+
+      /// Diagnoses appendInterpolation(...) calls with multiple
+      /// arguments or argument labels and corrects them.
+      class StrangeInterpolationRewriter : public ASTWalker {
+        TypeChecker &TC;
+
+      public:
+        StrangeInterpolationRewriter(TypeChecker &TC) : TC(TC) { }
+
+        virtual bool walkToDeclPre(Decl *D) {
+          // We don't want to look inside decls.
+          return false;
+        }
+
+        virtual std::pair<bool, Expr *> walkToExprPre(Expr *E) {
+          // One InterpolatedStringLiteralExpr should never be nested inside
+          // another except as a child of a CallExpr, and we don't recurse into
+          // the children of CallExprs.
+          assert(!isa<InterpolatedStringLiteralExpr>(E) &&
+                 "StrangeInterpolationRewriter found nested interpolation?");
+
+          // We only care about CallExprs.
+          if (!isa<CallExpr>(E))
+            return { true, E };
+
+          auto call = cast<CallExpr>(E);
+          if (auto callee = dyn_cast<UnresolvedDotExpr>(call->getFn())) {
+            if (callee->getName().getBaseName() ==
+                    TC.Context.Id_appendInterpolation) {
+              Expr *newArg = nullptr;
+              SourceLoc lParen, rParen;
+
+              if (call->getNumArguments() > 1) {
+                auto *args = cast<TupleExpr>(call->getArg());
+
+                lParen = args->getLParenLoc();
+                rParen = args->getRParenLoc();
+                Expr *secondArg = args->getElement(1);
+
+                TC.diagnose(secondArg->getLoc(),
+                            diag::string_interpolation_list_changing)
+                  .highlightChars(secondArg->getLoc(), rParen);
+                TC.diagnose(secondArg->getLoc(),
+                            diag::string_interpolation_list_insert_parens)
+                  .fixItInsertAfter(lParen, "(")
+                  .fixItInsert(rParen, ")");
+
+                newArg = args;
+              }
+              else if(call->getNumArguments() == 1 &&
+                      call->getArgumentLabels().front() != Identifier()) {
+                auto *args = cast<TupleExpr>(call->getArg());
+                newArg = args->getElement(0);
+
+                lParen = args->getLParenLoc();
+                rParen = args->getRParenLoc();
+
+                SourceLoc argLabelLoc = call->getArgumentLabelLoc(0),
+                          argLoc = newArg->getStartLoc();
+
+                TC.diagnose(argLabelLoc,
+                            diag::string_interpolation_label_changing)
+                  .highlightChars(argLabelLoc, argLoc);
+                TC.diagnose(argLabelLoc,
+                            diag::string_interpolation_remove_label,
+                            call->getArgumentLabels().front())
+                  .fixItRemoveChars(argLabelLoc, argLoc);
+              }
+
+              // If newArg is no longer null, we need to build a new
+              // appendInterpolation(_:) call that takes it to replace the bad
+              // appendInterpolation(...) call.
+              if (newArg) {
+                auto newCallee = new (TC.Context) UnresolvedDotExpr(
+                    callee->getBase(), /*dotloc=*/SourceLoc(),
+                    DeclName(TC.Context.Id_appendInterpolation),
+                    /*nameloc=*/DeclNameLoc(), /*Implicit=*/true);
+
+                E = CallExpr::create(TC.Context, newCallee, lParen,
+                    { newArg }, { Identifier() }, { SourceLoc() },
+                    rParen, /*trailingClosure=*/nullptr, /*implicit=*/false);
+              }
+            }
+          }
+
+          // There is never a CallExpr between an InterpolatedStringLiteralExpr
+          // and an un-typechecked appendInterpolation(...) call, so whether we
+          // changed E or not, we don't need to recurse any deeper.
+          return { false, E };
+        }
+      };
+      
+      ISLE->getAppendingExpr()->walk(StrangeInterpolationRewriter(TC));
+    }
+
   public:
     PreCheckExpression(TypeChecker &tc, DeclContext *dc, Expr *parent)
         : TC(tc), DC(dc), ParentExpr(parent) {}
@@ -996,6 +1075,30 @@ namespace {
       if (auto unresolvedMember = dyn_cast<UnresolvedMemberExpr>(expr)) {
         if (auto arg = unresolvedMember->getArgument())
           CallArgs.insert(arg);
+      }
+
+      // FIXME(diagnostics): `InOutType` could appear here as a result
+      // of successful re-typecheck of the one of the sub-expressions e.g.
+      // `let _: Int = { (s: inout S) in s.bar() }`. On the first
+      // attempt to type-check whole expression `s.bar()` - is going
+      // to have a base which points directly to declaration of `S`.
+      // But when diagnostics attempts to type-check `s.bar()` standalone
+      // its base would be tranformed into `InOutExpr -> DeclRefExr`,
+      // and `InOutType` is going to be recorded in constraint system.
+      // One possible way to fix this (if diagnostics still use typecheck)
+      // might be to make it so self is not wrapped into `InOutExpr`
+      // but instead used as @lvalue type in some case of mutable members.
+      if (!expr->isImplicit()) {
+        if (isa<MemberRefExpr>(expr) || isa<DynamicMemberRefExpr>(expr)) {
+          auto *LE = cast<LookupExpr>(expr);
+          if (auto *IOE = dyn_cast<InOutExpr>(LE->getBase()))
+            LE->setBase(IOE->getSubExpr());
+        }
+
+        if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(expr)) {
+          if (auto *IOE = dyn_cast<InOutExpr>(DSCE->getBase()))
+            DSCE->setBase(IOE->getSubExpr());
+        }
       }
 
       // Local function used to finish up processing before returning. Every
@@ -1036,7 +1139,8 @@ namespace {
 
       if (auto PlaceholderE = dyn_cast<EditorPlaceholderExpr>(expr)) {
         if (!PlaceholderE->getTypeLoc().isNull()) {
-          if (!TC.validateType(PlaceholderE->getTypeLoc(), DC))
+          if (!TC.validateType(PlaceholderE->getTypeLoc(),
+                               TypeResolution::forContextual(DC), None))
             expr->setType(PlaceholderE->getTypeLoc().getType());
         }
         return finish(true, expr);
@@ -1068,16 +1172,26 @@ namespace {
 
           if (isa<TupleExpr>(parent) || isa<ParenExpr>(parent)) {
             auto call = parents.find(parent);
-            if (call != parents.end() &&
-                (isa<ApplyExpr>(call->getSecond()) ||
-                 isa<UnresolvedMemberExpr>(call->getSecond())))
-              return finish(true, expr);
+            if (call != parents.end()) {
+              if (isa<ApplyExpr>(call->getSecond()) ||
+                  isa<UnresolvedMemberExpr>(call->getSecond()))
+                return finish(true, expr);
+
+              if (isa<SubscriptExpr>(call->getSecond())) {
+                TC.diagnose(expr->getStartLoc(),
+                            diag::cannot_pass_inout_arg_to_subscript);
+                return finish(false, nullptr);
+              }
+            }
           }
         }
 
         TC.diagnose(expr->getStartLoc(), diag::extraneous_address_of);
         return finish(false, nullptr);
       }
+
+      if (auto *ISLE = dyn_cast<InterpolatedStringLiteralExpr>(expr))
+        correctInterpolationIfStrange(ISLE);
 
       return finish(true, expr);
     }
@@ -1244,18 +1358,13 @@ bool PreCheckExpression::walkToClosureExprPre(ClosureExpr *closure) {
   auto *PL = closure->getParameters();
 
   // Validate the parameters.
-  TypeResolutionOptions options;
+  TypeResolutionOptions options(TypeResolverContext::ClosureExpr);
   options |= TypeResolutionFlags::AllowUnspecifiedTypes;
   options |= TypeResolutionFlags::AllowUnboundGenerics;
-  options |= TypeResolutionFlags::InExpression;
-  options |= TypeResolutionFlags::AllowIUO;
   bool hadParameterError = false;
 
-  GenericTypeToArchetypeResolver resolver(closure);
-
-  if (TC.typeCheckParameterList(PL, DC, options, resolver)) {
-    closure->setType(ErrorType::get(TC.Context));
-
+  auto resolution = TypeResolution::forContextual(closure);
+  if (TC.typeCheckParameterList(PL, resolution, options)) {
     // If we encounter an error validating the parameter list, don't bail.
     // Instead, go on to validate any potential result type, and bail
     // afterwards.  This allows for better diagnostics, and keeps the
@@ -1265,9 +1374,8 @@ bool PreCheckExpression::walkToClosureExprPre(ClosureExpr *closure) {
 
   // Validate the result type, if present.
   if (closure->hasExplicitResultType() &&
-      TC.validateType(closure->getExplicitResultTypeLoc(), DC,
-                      TypeResolutionFlags::InExpression, &resolver)) {
-    closure->setType(ErrorType::get(TC.Context));
+      TC.validateType(closure->getExplicitResultTypeLoc(), resolution,
+                      TypeResolverContext::InExpression)) {
     return false;
   }
 
@@ -1349,10 +1457,11 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
     // Resolve the TypeRepr to get the base type for the lookup.
     // Disable availability diagnostics here, because the final
     // TypeRepr will be resolved again when generating constraints.
-    TypeResolutionOptions options = TypeResolutionFlags::AllowUnboundGenerics;
-    options |= TypeResolutionFlags::InExpression;
+    TypeResolutionOptions options(TypeResolverContext::InExpression);
+    options |= TypeResolutionFlags::AllowUnboundGenerics;
     options |= TypeResolutionFlags::AllowUnavailable;
-    auto BaseTy = TC.resolveType(InnerTypeRepr, DC, options);
+    auto resolution = TypeResolution::forContextual(DC);
+    auto BaseTy = resolution.resolveType(InnerTypeRepr, options);
 
     if (BaseTy && BaseTy->mayHaveMembers()) {
       auto lookupOptions = defaultMemberLookupOptions;
@@ -1726,7 +1835,6 @@ void PreCheckExpression::resolveKeyPathExpr(KeyPathExpr *KPE) {
 
   // Pre-order visit of a sequence foo.bar[0]?.baz, which means that the
   // components are pushed in reverse order.
-
   auto traversePath = [&](Expr *expr, bool isInParsedPath,
                           bool emitErrors = true) {
     Expr *outermostExpr = expr;
@@ -1743,7 +1851,12 @@ void PreCheckExpression::resolveKeyPathExpr(KeyPathExpr *KPE) {
       }
 
       // Recurring cases:
-      if (auto UDE = dyn_cast<UnresolvedDotExpr>(expr)) {
+      if (auto SE = dyn_cast<DotSelfExpr>(expr)) {
+        // .self, the identity component.
+        components.push_back(KeyPathExpr::Component::forIdentity(
+          SE->getSelfLoc()));
+        expr = SE->getSubExpr();
+      } else if (auto UDE = dyn_cast<UnresolvedDotExpr>(expr)) {
         // .foo
         components.push_back(KeyPathExpr::Component::forUnresolvedProperty(
             UDE->getName(), UDE->getLoc()));
@@ -1820,7 +1933,7 @@ void PreCheckExpression::resolveKeyPathExpr(KeyPathExpr *KPE) {
     traversePath(root, /*isInParsedPath=*/false);
   }
 
-  // Key paths must have at least one component.
+  // Key paths must be spelled with at least one component.
   if (components.empty()) {
     TC.diagnose(KPE->getLoc(), diag::expr_swift_keypath_empty);
     // Passes further down the pipeline expect keypaths to always have at least
@@ -1865,15 +1978,21 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
   Type type;
   if (typeExpr->getTypeLoc().wasValidated()) {
     type = typeExpr->getTypeLoc().getType();
-  } else if (auto *rep = typeExpr->getTypeRepr()) {
-    TypeResolutionOptions options;
+  } else {
+    TypeResolutionOptions options(TypeResolverContext::InExpression);
     options |= TypeResolutionFlags::AllowUnboundGenerics;
-    options |= TypeResolutionFlags::InExpression;
-    type = TC.resolveType(rep, DC, options);
-    typeExpr->getTypeLoc().setType(type);
+
+    auto &typeLoc = typeExpr->getTypeLoc();
+    bool hadError =
+        TC.validateType(typeLoc, TypeResolution::forContextual(DC), options);
+
+    if (hadError)
+      return nullptr;
+
+    type = typeLoc.getType();
   }
 
-  if (!type)
+  if (!type || !type->getAnyNominal())
     return nullptr;
 
   // Don't bother to convert deprecated selector syntax.
@@ -1882,16 +2001,13 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
       return nullptr;
   }
 
-  ConformanceCheckOptions options;
-  options |= ConformanceCheckFlags::InExpression;
-  options |= ConformanceCheckFlags::SkipConditionalRequirements;
-
-  auto result = TC.conformsToProtocol(type, protocol, DC, options);
-  if (!result || !result->isConcrete())
-    return nullptr;
-
-  return CoerceExpr::forLiteralInit(TC.Context, argExpr, call->getSourceRange(),
-                                    typeExpr->getTypeLoc());
+  auto *NTD = type->getAnyNominal();
+  SmallVector<ProtocolConformance *, 2> conformances;
+  return NTD->lookupConformance(DC->getParentModule(), protocol, conformances)
+             ? CoerceExpr::forLiteralInit(TC.Context, argExpr,
+                                          call->getSourceRange(),
+                                          typeExpr->getTypeLoc())
+             : nullptr;
 }
 
 /// Pre-check the expression, validating any types that occur in the
@@ -1920,6 +2036,11 @@ Expr *ExprTypeCheckListener::appliedSolution(Solution &solution, Expr *expr) {
   return expr;
 }
 
+void ExprTypeCheckListener::preCheckFailed(Expr *expr) {}
+void ExprTypeCheckListener::constraintGenerationFailed(Expr *expr) {}
+void ExprTypeCheckListener::applySolutionFailed(Solution &solution,
+                                                Expr *expr) {}
+
 void ParentConditionalConformance::diagnoseConformanceStack(
     DiagnosticEngine &diags, SourceLoc loc,
     ArrayRef<ParentConditionalConformance> conformances) {
@@ -1947,6 +2068,88 @@ bool GenericRequirementsCheckListener::diagnoseUnsatisfiedRequirement(
   return false;
 }
 
+/// Sometimes constraint solver fails without producing any diagnostics,
+/// that leads to crashes down the line in AST Verifier or SILGen
+/// which, as a result, are much harder to figure out.
+///
+/// This class is intended to guard against situations like that by
+/// keeping track of failures of different type-check phases, and
+/// emitting fallback fatal error if any of them fail without producing
+/// error diagnostic, and there were no errors emitted or scheduled to be
+/// emitted previously.
+class FallbackDiagnosticListener : public ExprTypeCheckListener {
+  TypeChecker &TC;
+  TypeCheckExprOptions Options;
+  ExprTypeCheckListener *BaseListener;
+
+public:
+  FallbackDiagnosticListener(TypeChecker &TC, TypeCheckExprOptions options,
+                             ExprTypeCheckListener *base)
+      : TC(TC), Options(options), BaseListener(base) {}
+
+  bool builtConstraints(ConstraintSystem &cs, Expr *expr) override {
+    return BaseListener ? BaseListener->builtConstraints(cs, expr) : false;
+  }
+
+  Expr *foundSolution(Solution &solution, Expr *expr) override {
+    return BaseListener ? BaseListener->foundSolution(solution, expr) : expr;
+  }
+
+  Expr *appliedSolution(Solution &solution, Expr *expr) override {
+    return BaseListener ? BaseListener->appliedSolution(solution, expr) : expr;
+  }
+
+  void preCheckFailed(Expr *expr) override {
+    if (BaseListener)
+      BaseListener->preCheckFailed(expr);
+    maybeProduceFallbackDiagnostic(expr);
+  }
+
+  void constraintGenerationFailed(Expr *expr) override {
+    if (BaseListener)
+      BaseListener->constraintGenerationFailed(expr);
+    maybeProduceFallbackDiagnostic(expr);
+  }
+
+  void applySolutionFailed(Solution &solution, Expr *expr) override {
+    if (BaseListener)
+      BaseListener->applySolutionFailed(solution, expr);
+
+    if (hadAnyErrors())
+      return;
+
+    // If solution involves invalid or incomplete conformances that's
+    // a probable cause of failure to apply it without producing an error,
+    // which is going to be diagnosed later, so let's not produce
+    // fallback diagnostic in this case.
+    if (llvm::any_of(
+            solution.Conformances,
+            [](const std::pair<ConstraintLocator *, ProtocolConformanceRef>
+                   &conformance) -> bool {
+              auto &ref = conformance.second;
+              return ref.isConcrete() && ref.getConcrete()->isInvalid();
+            }))
+      return;
+
+    maybeProduceFallbackDiagnostic(expr);
+  }
+
+private:
+  bool hadAnyErrors() const { return TC.Context.Diags.hadAnyError(); }
+
+  void maybeProduceFallbackDiagnostic(Expr *expr) const {
+    if (Options.contains(TypeCheckExprFlags::SubExpressionDiagnostics) ||
+        Options.contains(TypeCheckExprFlags::SuppressDiagnostics))
+      return;
+
+    // Before producing fatal error here, let's check if there are any "error"
+    // diagnostics already emitted or waiting to be emitted. Because they are
+    // a better indication of the problem.
+    if (!(hadAnyErrors() || TC.Context.hasDelayedConformanceErrors()))
+      TC.diagnose(expr->getLoc(), diag::failed_to_produce_diagnostic);
+  }
+};
+
 #pragma mark High-level entry points
 Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
                                       TypeLoc convertType,
@@ -1954,12 +2157,26 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
                                       TypeCheckExprOptions options,
                                       ExprTypeCheckListener *listener,
                                       ConstraintSystem *baseCS) {
+  FallbackDiagnosticListener diagListener(*this, options, listener);
+  return typeCheckExpressionImpl(expr, dc, convertType, convertTypePurpose,
+                                 options, diagListener, baseCS);
+}
+
+Type TypeChecker::typeCheckExpressionImpl(Expr *&expr, DeclContext *dc,
+                                          TypeLoc convertType,
+                                          ContextualTypePurpose convertTypePurpose,
+                                          TypeCheckExprOptions options,
+                                          ExprTypeCheckListener &listener,
+                                          ConstraintSystem *baseCS) {
+  FrontendStatsTracer StatsTracer(Context.Stats, "typecheck-expr", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
 
   // First, pre-check the expression, validating any types that occur in the
   // expression and folding sequence expressions.
-  if (preCheckExpression(expr, dc))
+  if (preCheckExpression(expr, dc)) {
+    listener.preCheckFailed(expr);
     return Type();
+  }
 
   // Construct a constraint system from this expression.
   ConstraintSystemOptions csOptions = ConstraintSystemFlags::AllowFixes;
@@ -1970,7 +2187,13 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
   if (options.contains(TypeCheckExprFlags::AllowUnresolvedTypeVariables))
     csOptions |= ConstraintSystemFlags::AllowUnresolvedTypeVariables;
 
-  ConstraintSystem cs(*this, dc, csOptions);
+  if (options.contains(TypeCheckExprFlags::ConvertTypeIsOpaqueReturnType))
+    csOptions |= ConstraintSystemFlags::UnderlyingTypeForOpaqueReturnType;
+
+  if (options.contains(TypeCheckExprFlags::SubExpressionDiagnostics))
+    csOptions |= ConstraintSystemFlags::SubExpressionDiagnostics;
+
+  ConstraintSystem cs(*this, dc, csOptions, expr);
   cs.baseCS = baseCS;
 
   // Verify that a purpose was specified if a convertType was.  Note that it is
@@ -1980,12 +2203,11 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
          "Purpose for conversion type was not specified");
 
   // Take a look at the conversion type to check to make sure it is sensible.
-  if (convertType.getType()) {
+  if (auto type = convertType.getType()) {
     // If we're asked to convert to an UnresolvedType, then ignore the request.
     // This happens when CSDiags nukes a type.
-    if (convertType.getType()->is<UnresolvedType>() ||
-        (convertType.getType()->is<MetatypeType>() &&
-         convertType.getType()->hasUnresolvedType())) {
+    if (type->is<UnresolvedType>() ||
+        (type->is<MetatypeType>() && type->hasUnresolvedType())) {
       convertType = TypeLoc();
       convertTypePurpose = CTP_Unused;
     }
@@ -2009,16 +2231,15 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
   Type convertTo = convertType.getType();
   if (options.contains(TypeCheckExprFlags::ExpressionTypeMustBeOptional)) {
     assert(!convertTo && "convertType and type check options conflict");
-    auto *convertTypeLocator = cs.getConstraintLocator(
-        cs.getConstraintLocator(expr), ConstraintLocator::ContextualType);
-    Type var = cs.createTypeVariable(convertTypeLocator);
+    auto *convertTypeLocator =
+        cs.getConstraintLocator(expr, LocatorPathElt::getContextualType());
+    Type var = cs.createTypeVariable(convertTypeLocator, TVO_CanBindToNoEscape);
     convertTo = getOptionalType(expr->getLoc(), var);
   }
 
-  // Attempt to solve the constraint system.
   SmallVector<Solution, 4> viable;
-  if (cs.solve(expr, convertTo, listener, viable,
-               allowFreeTypeVariables))
+  // Attempt to solve the constraint system.
+  if (cs.solve(expr, convertTo, &listener, viable, allowFreeTypeVariables))
     return Type();
 
   // If the client allows the solution to have unresolved type expressions,
@@ -2032,37 +2253,32 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
 
   auto result = expr;
   auto &solution = viable[0];
-  if (listener) {
-    result = listener->foundSolution(solution, result);
-    if (!result)
-      return Type();
-  }
-
-  if (options.contains(TypeCheckExprFlags::SkipApplyingSolution))
-    return solution.simplifyType(cs.getType(expr));
+  result = listener.foundSolution(solution, result);
+  if (!result)
+    return Type();
 
   // Apply the solution to the expression.
   result = cs.applySolution(
       solution, result, convertType.getType(),
       options.contains(TypeCheckExprFlags::IsDiscarded),
       options.contains(TypeCheckExprFlags::SkipMultiStmtClosures));
+
   if (!result) {
+    listener.applySolutionFailed(solution, expr);
     // Failure already diagnosed, above, as part of applying the solution.
     return Type();
   }
+
+  // Notify listener that we've applied the solution.
+  result = listener.appliedSolution(solution, result);
+  if (!result)
+    return Type();
 
   if (getLangOpts().DebugConstraintSolver) {
     auto &log = Context.TypeCheckerDebug->getStream();
     log << "---Type-checked expression---\n";
     result->dump(log);
-  }
-
-  // If there's a listener, notify it that we've applied the solution.
-  if (listener) {
-    result = listener->appliedSolution(solution, result);
-    if (!result) {
-      return Type();
-    }
+    log << "\n";
   }
 
   // Unless the client has disabled them, perform syntactic checks on the
@@ -2077,11 +2293,47 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
   return cs.getType(expr);
 }
 
+Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
+                                            DeclContext *DC, Type paramType,
+                                            bool isAutoClosure, bool canFail) {
+  assert(paramType && !paramType->hasError());
+
+  if (isAutoClosure) {
+    class AutoClosureListener : public ExprTypeCheckListener {
+      DeclContext *DC;
+      FunctionType *ParamType;
+
+    public:
+      AutoClosureListener(DeclContext *DC, FunctionType *paramType)
+          : DC(DC), ParamType(paramType) {}
+
+      Expr *appliedSolution(constraints::Solution &solution,
+                            Expr *expr) override {
+        auto &cs = solution.getConstraintSystem();
+        auto *closure = cs.TC.buildAutoClosureExpr(DC, expr, ParamType);
+        cs.cacheExprTypes(closure);
+        return closure;
+      }
+    };
+
+    auto *fnType = paramType->castTo<FunctionType>();
+    AutoClosureListener listener(DC, fnType);
+    return typeCheckExpression(defaultValue, DC,
+                               TypeLoc::withoutLoc(fnType->getResult()),
+                               canFail ? CTP_DefaultParameter : CTP_CannotFail,
+                               TypeCheckExprOptions(), &listener);
+  }
+
+  return typeCheckExpression(defaultValue, DC, TypeLoc::withoutLoc(paramType),
+                             canFail ? CTP_DefaultParameter : CTP_CannotFail);
+}
+
 Type TypeChecker::
 getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
                                    ConcreteDeclRef &referencedDecl,
                                  FreeTypeVariableBinding allowFreeTypeVariables,
                                    ExprTypeCheckListener *listener) {
+  FrontendStatsTracer StatsTracer(Context.Stats, "typecheck-expr-no-apply", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
   referencedDecl = nullptr;
 
@@ -2163,6 +2415,7 @@ void TypeChecker::getPossibleTypesOfExpressionWithoutApplying(
     Expr *&expr, DeclContext *dc, SmallPtrSetImpl<TypeBase *> &types,
     FreeTypeVariableBinding allowFreeTypeVariables,
     ExprTypeCheckListener *listener) {
+  FrontendStatsTracer StatsTracer(Context.Stats, "get-possible-types-no-apply", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
 
   // Construct a constraint system from this expression.
@@ -2189,146 +2442,138 @@ void TypeChecker::getPossibleTypesOfExpressionWithoutApplying(
   }
 }
 
-bool TypeChecker::typeCheckCompletionSequence(Expr *&expr, DeclContext *DC) {
+static FunctionType *
+getTypeOfCompletionOperatorImpl(TypeChecker &TC, DeclContext *DC, Expr *expr,
+                                ConcreteDeclRef &referencedDecl) {
+  ASTContext &Context = TC.Context;
+
+  FrontendStatsTracer StatsTracer(Context.Stats,
+                                  "typecheck-completion-operator", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
 
+  ConstraintSystemOptions options;
+  options |= ConstraintSystemFlags::SuppressDiagnostics;
+  options |= ConstraintSystemFlags::ReusePrecheckedType;
+
   // Construct a constraint system from this expression.
-  ConstraintSystem CS(*this, DC, ConstraintSystemFlags::SuppressDiagnostics);
+  ConstraintSystem CS(TC, DC, options);
+  expr = CS.generateConstraints(expr);
+  if (!expr)
+    return nullptr;
 
-  auto *SE = cast<SequenceExpr>(expr);
-  assert(SE->getNumElements() >= 3);
-  auto *op = SE->getElement(SE->getNumElements() - 2);
-  auto *CCE = cast<CodeCompletionExpr>(SE->getElements().back());
-
-  // Resolve the op.
-  op = resolveDeclRefExpr(cast<UnresolvedDeclRefExpr>(op), DC);
-  SE->setElement(SE->getNumElements() - 2, op);
-
-  // Fold the sequence.
-  expr = foldSequence(SE, DC);
-
-  // Find the code-completion expression and operator again.
-  Expr *exprAsBinOp = nullptr;
-  while (true) {
-    Expr *RHS;
-    if (auto *binExpr = dyn_cast<BinaryExpr>(expr))
-      RHS = binExpr->getArg()->getElement(1);
-    else if (auto *assignExpr = dyn_cast<AssignExpr>(expr))
-      RHS = assignExpr->getSrc();
-    else if (auto *ifExpr = dyn_cast<IfExpr>(expr))
-      RHS = ifExpr->getElseExpr();
-    else
-      break;
-
-    if (RHS == CCE) {
-      exprAsBinOp = expr;
-      break;
-    }
-    expr = RHS;
-  }
-  if (!exprAsBinOp)
-    return true;
-
-  // Ensure the output expression is up to date.
-  assert(exprAsBinOp == expr && isa<BinaryExpr>(expr) && "found wrong expr?");
-
-  // Add type variable for the code-completion expression.
-  CCE->setActivated();
-
-  if (auto generated = CS.generateConstraints(expr)) {
-    expr = generated;
-  } else {
-    return true;
-  }
-
-  if (getLangOpts().DebugConstraintSolver) {
+  if (TC.getLangOpts().DebugConstraintSolver) {
     auto &log = Context.TypeCheckerDebug->getStream();
     log << "---Initial constraints for the given expression---\n";
-    expr->print(log);
+    expr->dump(log);
     log << "\n";
     CS.print(log);
   }
 
   // Attempt to solve the constraint system.
   SmallVector<Solution, 4> viable;
-  if (CS.solve(expr, viable, FreeTypeVariableBinding::UnresolvedType))
-    return true;
+  if (CS.solve(expr, viable, FreeTypeVariableBinding::Disallow))
+    return nullptr;
 
   auto &solution = viable[0];
-  if (getLangOpts().DebugConstraintSolver) {
+  if (TC.getLangOpts().DebugConstraintSolver) {
     auto &log = Context.TypeCheckerDebug->getStream();
     log << "---Solution---\n";
     solution.dump(log);
   }
 
-  auto &solutionCS = solution.getConstraintSystem();
-  expr->setType(solution.simplifyType(solutionCS.getType(expr)));
-  auto completionType = solution.simplifyType(solutionCS.getType(CCE));
+  // Fill the results.
+  Expr *opExpr = cast<ApplyExpr>(expr)->getFn();
+  referencedDecl =
+      solution.resolveLocatorToDecl(CS.getConstraintLocator(opExpr));
 
-  // If completion expression is unresolved it doesn't provide
-  // any meaningful information so shouldn't be in the results.
-  if (completionType->is<UnresolvedType>())
-    return true;
+  // Return '(ArgType[, ArgType]) -> ResultType' as a function type.
+  // We don't use the type of the operator expression because we want the types
+  // of the *arguments* instead of the types of the parameters.
+  Expr *argsExpr = cast<ApplyExpr>(expr)->getArg();
+  SmallVector<FunctionType::Param, 2> argTypes;
+  if (auto *PE = dyn_cast<ParenExpr>(argsExpr)) {
+    argTypes.emplace_back(solution.simplifyType(CS.getType(PE->getSubExpr())));
+  } else if (auto *TE = dyn_cast<TupleExpr>(argsExpr)) {
+    for (auto arg : TE->getElements())
+      argTypes.emplace_back(solution.simplifyType(CS.getType(arg)));
+  }
 
-  CCE->setType(completionType);
-  return false;
+  return FunctionType::get(argTypes, solution.simplifyType(CS.getType(expr)));
 }
 
-bool TypeChecker::typeCheckExpressionShallow(Expr *&expr, DeclContext *dc) {
-  PrettyStackTraceExpr stackTrace(Context, "shallow type-checking", expr);
+/// Return the type of operator function for specified LHS, or a null
+/// \c Type on error.
+FunctionType *
+TypeChecker::getTypeOfCompletionOperator(DeclContext *DC, Expr *LHS,
+                                         Identifier opName, DeclRefKind refKind,
+                                         ConcreteDeclRef &referencedDecl) {
 
-  // Construct a constraint system from this expression.
-  ConstraintSystem cs(*this, dc, ConstraintSystemFlags::AllowFixes);
-  if (auto generatedExpr = cs.generateConstraintsShallow(expr))
-    expr = generatedExpr;
-  else
-    return true;
+  // For the infix operator, find the actual LHS from pre-folded LHS.
+  if (refKind == DeclRefKind::BinaryOperator)
+    LHS = findLHS(DC, LHS, opName);
 
-  if (getLangOpts().DebugConstraintSolver) {
-    auto &log = Context.TypeCheckerDebug->getStream();
-    log << "---Initial constraints for the given expression---\n";
-    expr->print(log);
-    log << "\n";
-    cs.print(log);
+  if (!LHS)
+    return nullptr;
+
+  auto LHSTy = LHS->getType();
+
+  // FIXME: 'UnresolvedType' still might be typechecked by an operator.
+  if (!LHSTy || LHSTy->is<UnresolvedType>())
+    return nullptr;
+
+  // Meta types and function types cannot be a operand of operator expressions.
+  if (LHSTy->is<MetatypeType>() || LHSTy->is<AnyFunctionType>())
+    return nullptr;
+
+  auto Loc = LHS->getEndLoc();
+
+  // Build temporary expression to typecheck.
+  // We allocate these expressions on the stack because we know they can't
+  // escape and there isn't a better way to allocate scratch Expr nodes.
+  UnresolvedDeclRefExpr UDRE(opName, refKind, DeclNameLoc(Loc));
+  auto *opExpr = resolveDeclRefExpr(&UDRE, DC);
+
+  switch (refKind) {
+
+  case DeclRefKind::PostfixOperator: {
+    // (postfix_unary_expr
+    //   (declref_expr name=<opName>)
+    //   (paren_expr
+    //     (<LHS>)))
+    ParenExpr Args(SourceLoc(), LHS, SourceLoc(),
+                   /*hasTrailingClosure=*/false);
+    PostfixUnaryExpr postfixExpr(opExpr, &Args);
+    return getTypeOfCompletionOperatorImpl(*this, DC, &postfixExpr,
+                                           referencedDecl);
   }
 
-  // Attempt to solve the constraint system.
-  SmallVector<Solution, 4> viable;
-  if ((cs.solve(expr, viable) || viable.size() != 1) &&
-      cs.salvage(viable, expr)) {
-    return true;
+  case DeclRefKind::BinaryOperator: {
+    // (binary_expr
+    //   (declref_expr name=<opName>)
+    //   (tuple_expr
+    //     (<LHS>)
+    //     (code_completion_expr)))
+    CodeCompletionExpr dummyRHS(Loc);
+    auto Args = TupleExpr::create(
+        Context, SourceLoc(), {LHS, &dummyRHS}, {}, {}, SourceLoc(),
+        /*hasTrailingClosure=*/false, /*isImplicit=*/true);
+    BinaryExpr binaryExpr(opExpr, Args, /*isImplicit=*/true);
+
+    return getTypeOfCompletionOperatorImpl(*this, DC, &binaryExpr,
+                                           referencedDecl);
   }
 
-  auto &solution = viable[0];
-  if (getLangOpts().DebugConstraintSolver) {
-    auto &log = Context.TypeCheckerDebug->getStream();
-    log << "---Solution---\n";
-    solution.dump(log);
+  default:
+    llvm_unreachable("Invalid DeclRefKind for operator completion");
   }
-
-  // Apply the solution to the expression.
-  auto result = cs.applySolutionShallow(solution, expr, 
-                                        /*suppressDiagnostics=*/false);
-  if (!result) {
-    // Failure already diagnosed, above, as part of applying the solution.
-    return true;
-  }
-
-  if (getLangOpts().DebugConstraintSolver) {
-    auto &log = Context.TypeCheckerDebug->getStream();
-    log << "---Type-checked expression---\n";
-    result->dump(log);
-  }
-
-  expr = result;
-  return false;
 }
 
 bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
-                                   DeclContext *DC, bool skipApplyingSolution) {
+                                   DeclContext *DC) {
 
   /// Type checking listener for pattern binding initializers.
   class BindingListener : public ExprTypeCheckListener {
+    TypeChecker &tc;
     Pattern *&pattern;
     Expr *&initializer;
 
@@ -2336,31 +2581,89 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
     ConstraintLocator *Locator;
 
     /// The type of the initializer.
-    llvm::PointerIntPair<Type, 1, bool> InitTypeAndInOut;
+    Type initType;
+
+    /// The variable to that has property wrappers that have been applied to the initializer expression.
+    VarDecl *wrappedVar = nullptr;
 
   public:
-    explicit BindingListener(Pattern *&pattern, Expr *&initializer)
-      : pattern(pattern), initializer(initializer),
-        Locator(nullptr), InitTypeAndInOut(Type(), false) { }
+    explicit BindingListener(TypeChecker &tc, Pattern *&pattern,
+                             Expr *&initializer)
+      : tc(tc), pattern(pattern), initializer(initializer),
+        Locator(nullptr) {
+      maybeApplyPropertyWrapper();
+    }
 
-    Type getInitType() const { return InitTypeAndInOut.getPointer(); }
-    bool isInOut() const { return InitTypeAndInOut.getInt(); }
+    /// Retrieve the type to which the pattern should be coerced.
+    Type getPatternInitType(ConstraintSystem *cs) const {
+      if (!wrappedVar || initType->hasError() ||
+          initType->is<TypeVariableType>())
+        return initType;
+
+      // When we have an active constraint system, form value-member
+      // constraints to dig in to the appropriate resulting property.
+      if (cs) {
+        Type valueType = LValueType::get(initType);
+        auto dc = wrappedVar->getInnermostDeclContext();
+        auto emptyLocator = cs->getConstraintLocator(nullptr);
+
+        for (unsigned i : indices(wrappedVar->getAttachedPropertyWrappers())) {
+          auto wrapperInfo = wrappedVar->getAttachedPropertyWrapperTypeInfo(i);
+          if (!wrapperInfo)
+            break;
+
+          Type memberType =
+              cs->createTypeVariable(emptyLocator, TVO_CanBindToLValue);
+          cs->addValueMemberConstraint(
+              valueType, wrapperInfo.valueVar->getFullName(),
+              memberType, dc, FunctionRefKind::Unapplied, { }, emptyLocator);
+          valueType = memberType;
+        }
+        
+        // Set up an equality constraint to drop the lvalue-ness of the value
+        // type we produced.
+        Type propertyType = cs->createTypeVariable(emptyLocator, 0);
+        cs->addConstraint(ConstraintKind::Equal, propertyType, valueType,
+                          emptyLocator);
+        return propertyType;
+      }
+      
+      // Otherwise, compute the wrapped value type directly.
+      return computeWrappedValueType(wrappedVar, initType);
+    }
 
     bool builtConstraints(ConstraintSystem &cs, Expr *expr) override {
+      assert(!expr->isSemanticallyInOutExpr());
+
       // Save the locator we're using for the expression.
-      Locator = cs.getConstraintLocator(expr);
+      Locator =
+          cs.getConstraintLocator(expr, LocatorPathElt::getContextualType());
 
       // Collect constraints from the pattern.
-      InitTypeAndInOut.setPointer(cs.generateConstraints(pattern, Locator));
-      InitTypeAndInOut.setInt(expr->isSemanticallyInOutExpr());
-      if (!InitTypeAndInOut.getPointer())
+      Type patternType = cs.generateConstraints(pattern, Locator);
+      if (!patternType)
         return true;
 
-      assert(!InitTypeAndInOut.getPointer()->is<InOutType>());
-      // Add a conversion constraint between the types.
-      cs.addConstraint(ConstraintKind::Conversion, cs.getType(expr),
-                       InitTypeAndInOut.getPointer(), Locator,
-                       /*isFavored*/true);
+      if (wrappedVar) {
+        // When we have applied a property wrapper, the initializer type
+        // is the initialization of the property wrapper instance.
+        initType = cs.getType(expr);
+
+        // Add a conversion constraint between the pattern type and the
+        // property wrapper's "value" type.
+        cs.addConstraint(ConstraintKind::Conversion, patternType,
+                         getPatternInitType(&cs), Locator, /*isFavored*/true);
+      } else {
+        // The initializer type is the type of the pattern.
+        initType = patternType;
+
+        // Add a conversion constraint between the types.
+        if (!cs.Options.contains(
+                   ConstraintSystemFlags::UnderlyingTypeForOpaqueReturnType)) {
+          cs.addConstraint(ConstraintKind::Conversion, cs.getType(expr),
+                           patternType, Locator, /*isFavored*/true);
+        }
+      }
 
       // The expression has been pre-checked; save it in case we fail later.
       initializer = expr;
@@ -2369,10 +2672,8 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
 
     Expr *foundSolution(Solution &solution, Expr *expr) override {
       // Figure out what type the constraints decided on.
-      auto ty = solution.simplifyType(InitTypeAndInOut.getPointer());
-      InitTypeAndInOut.setPointer(
-          ty->getRValueType()->reconstituteSugar(/*recursive =*/false));
-      InitTypeAndInOut.setInt(expr->isSemanticallyInOutExpr());
+      auto ty = solution.simplifyType(initType);
+      initType = ty->getRValueType()->reconstituteSugar(/*recursive =*/false);
 
       // Just keep going.
       return expr;
@@ -2380,34 +2681,106 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
 
     Expr *appliedSolution(Solution &solution, Expr *expr) override {
       // Convert the initializer to the type of the pattern.
-      // ignoreTopLevelInjection = Binding->isConditional()
-      expr = solution.coerceToType(expr, InitTypeAndInOut.getPointer(), Locator,
+      expr = solution.coerceToType(expr, initType, Locator,
                                    false /* ignoreTopLevelInjection */);
-      if (!expr) {
+      if (!expr)
         return nullptr;
-      }
 
-      assert(solution.getConstraintSystem().getType(expr)->isEqual(InitTypeAndInOut.getPointer()));
+      assert(solution.getConstraintSystem().getType(expr)->isEqual(initType));
+
+      // Record the property wrapper type and note that the initializer has
+      // been subsumed by the backing property.
+      if (wrappedVar) {
+        wrappedVar->getParentPatternBinding()->setInitializerSubsumed(0);
+        tc.Context.setSideCachedPropertyWrapperBackingPropertyType(
+            wrappedVar, initType->mapTypeOutOfContext());
+
+        // Record the semantic initializer on the outermost property wrapper.
+        wrappedVar->getAttachedPropertyWrappers().front()
+            ->setSemanticInit(expr);
+      }
 
       initializer = expr;
       return expr;
     }
+
+  private:
+    // If the pattern contains a single variable that has an attached
+    // property wrapper, set up the initializer expression to initialize
+    // the backing storage.
+    void maybeApplyPropertyWrapper() {
+      auto singleVar = pattern->getSingleVar();
+      if (!singleVar)
+        return;
+
+      auto wrapperAttrs = singleVar->getAttachedPropertyWrappers();
+      if (wrapperAttrs.empty())
+        return;
+
+      // If the outermost property wrapper is directly initialized, form the
+      // call.
+      auto &ctx = singleVar->getASTContext();
+      auto outermostWrapperAttr = wrapperAttrs.front();
+      if (initializer) {
+        // Form init(wrappedValue:) call(s).
+        Expr *wrappedInitializer =
+            buildPropertyWrapperInitialValueCall(
+                singleVar, Type(), initializer, /*ignoreAttributeArgs=*/false);
+        if (!wrappedInitializer)
+          return;
+
+        initializer = wrappedInitializer;
+      } else if (auto outermostArg = outermostWrapperAttr->getArg()) {
+        Type outermostWrapperType =
+            singleVar->getAttachedPropertyWrapperType(0);
+        if (!outermostWrapperType)
+          return;
+        
+        auto typeExpr = TypeExpr::createImplicitHack(
+            outermostWrapperAttr->getTypeLoc().getLoc(),
+            outermostWrapperType, ctx);
+        initializer = CallExpr::create(
+            ctx, typeExpr, outermostArg,
+            outermostWrapperAttr->getArgumentLabels(),
+            outermostWrapperAttr->getArgumentLabelLocs(),
+            /*hasTrailingClosure=*/false,
+            /*implicit=*/false);
+      } else {
+        llvm_unreachable("No initializer anywhere?");
+      }
+      wrapperAttrs[0]->setSemanticInit(initializer);
+
+      // Note that we have applied to property wrapper, so we can adjust
+      // the initializer type later.
+      wrappedVar = singleVar;
+    }
   };
 
-  assert(initializer && "type-checking an uninitialized binding?");
-  BindingListener listener(pattern, initializer);
+  BindingListener listener(*this, pattern, initializer);
+  if (!initializer)
+    return true;
 
   TypeLoc contextualType;
   auto contextualPurpose = CTP_Unused;
   TypeCheckExprOptions flags = TypeCheckExprFlags::ConvertTypeIsOnlyAHint;
 
+  // Set the contextual purpose even if the pattern doesn't have a type so
+  // if there's an error we can use that information to inform diagnostics.
+  contextualPurpose = CTP_Initialization;
+
   if (pattern->hasType()) {
     contextualType = TypeLoc::withoutLoc(pattern->getType());
-    contextualPurpose = CTP_Initialization;
 
     // If we already had an error, don't repeat the problem.
     if (contextualType.getType()->hasError())
       return true;
+    
+    // Allow the initializer expression to establish the underlying type of an
+    // opaque type.
+    if (auto opaqueType = pattern->getType()->getAs<OpaqueTypeArchetypeType>()){
+      flags |= TypeCheckExprFlags::ConvertTypeIsOpaqueReturnType;
+      flags -= TypeCheckExprFlags::ConvertTypeIsOnlyAHint;
+    }
 
     // Only provide a TypeLoc if it makes sense to allow diagnostics.
     if (auto *typedPattern = dyn_cast<TypedPattern>(pattern)) {
@@ -2420,50 +2793,26 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
   }
     
   // Type-check the initializer.
-  if (skipApplyingSolution)
-    flags |= TypeCheckExprFlags::SkipApplyingSolution;
-
   auto resultTy = typeCheckExpression(initializer, DC, contextualType,
                                       contextualPurpose, flags, &listener);
 
-  // If we detected that the initializer would have a non-materializable type,
-  // complain.
-  if (resultTy && listener.isInOut()) {
-    diagnose(pattern->getStartLoc(), diag::var_type_not_materializable,
-             resultTy);
-
-    pattern->setType(ErrorType::get(Context));
-    pattern->forEachVariable([&](VarDecl *var) {
-      // Don't change the type of a variable that we've been able to
-      // compute a type for.
-      if (var->hasType() &&
-          !var->getType()->hasUnboundGenericType() &&
-          !var->getType()->hasError())
-        return;
-
-      var->markInvalid();
-    });
-
-    return true;
-  }
-
   if (resultTy) {
-    TypeResolutionOptions options = TypeResolutionFlags::OverrideType;
-    options |= TypeResolutionFlags::InExpression;
-    if (isa<EditorPlaceholderExpr>(initializer->getSemanticsProvidingExpr())) {
-      options |= TypeResolutionFlags::EditorPlaceholder;
-    }
+    TypeResolutionOptions options =
+        isa<EditorPlaceholderExpr>(initializer->getSemanticsProvidingExpr())
+        ? TypeResolverContext::EditorPlaceholderExpr
+        : TypeResolverContext::InExpression;
+    options |= TypeResolutionFlags::OverrideType;
 
     // FIXME: initTy should be the same as resultTy; now that typeCheckExpression()
     // returns a Type and not bool, we should be able to simplify the listener
     // implementation here.
-    auto initTy = listener.getInitType();
+    auto initTy = listener.getPatternInitType(nullptr);
     if (initTy->hasDependentMember())
       return true;
 
     // Apply the solution to the pattern as well.
-    if (coercePatternToType(pattern, DC, initTy, options,
-                            nullptr, TypeLoc())) {
+    if (coercePatternToType(pattern, TypeResolution::forContextual(DC), initTy,
+                            options, TypeLoc())) {
       return true;
     }
   }
@@ -2493,16 +2842,10 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
 }
 
 bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
-                                          unsigned patternNumber,
-                                          bool skipApplyingSolution) {
+                                          unsigned patternNumber) {
   const auto &pbe = PBD->getPatternList()[patternNumber];
   Pattern *pattern = PBD->getPattern(patternNumber);
   Expr *init = PBD->getInit(patternNumber);
-
-  if (!init) {
-    PBD->setInvalid();
-    return true;
-  }
 
   // Enter an initializer context if necessary.
   PatternBindingInitializer *initContext = nullptr;
@@ -2513,29 +2856,44 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
       DC = initContext;
   }
 
-  bool hadError = typeCheckBinding(pattern, init, DC, skipApplyingSolution);
+  bool hadError = typeCheckBinding(pattern, init, DC);
+  if (!init) {
+    PBD->setInvalid();
+    return true;
+  }
+
   PBD->setPattern(patternNumber, pattern, initContext);
   PBD->setInit(patternNumber, init);
 
-  if (!hadError) {
-    // If we're performing an binding to a weak or unowned variable from a
-    // constructor call, emit a warning that the instance will be immediately
-    // deallocated.
-    diagnoseUnownedImmediateDeallocation(*this, pattern, pbe.getEqualLoc(),
-                                         init);
-
-    // If we entered an initializer context, contextualize any
-    // auto-closures we might have created.
-    if (initContext) {
-      // Check safety of error-handling in the declaration, too.
-      checkInitializerErrorHandling(initContext, init);
-      (void)contextualizeInitializer(initContext, init);
+  // Bind a property with an opaque return type to the underlying type
+  // given by the initializer.
+  if (auto var = pattern->getSingleVar()) {
+    if (auto opaque = var->getOpaqueResultTypeDecl()) {
+      if (auto convertedInit = dyn_cast<UnderlyingToOpaqueExpr>(init)) {
+        auto underlyingType = convertedInit->getSubExpr()->getType()
+            ->mapTypeOutOfContext();
+        auto underlyingSubs = SubstitutionMap::get(
+          opaque->getOpaqueInterfaceGenericSignature(),
+          [&](SubstitutableType *t) -> Type {
+            if (t->isEqual(opaque->getUnderlyingInterfaceType())) {
+              return underlyingType;
+            }
+            return Type(t);
+          },
+          LookUpConformanceInModule(opaque->getModuleContext()));
+        
+        opaque->setUnderlyingTypeSubstitutions(underlyingSubs);
+      } else {
+        diagnose(var->getLoc(), diag::opaque_type_var_no_underlying_type);
+      }
     }
-  } else {
-    PBD->setInvalid();
   }
+  
+  if (hadError)
+    PBD->setInvalid();
 
   PBD->setInitializerChecked(patternNumber);
+  
   return hadError;
 }
 
@@ -2569,84 +2927,29 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
         return true;
       }
 
-      SequenceType = cs.createTypeVariable(Locator);
+      auto elementAssocType =
+        cast<AssociatedTypeDecl>(
+          sequenceProto->lookupDirect(tc.Context.Id_Element).front());
+
+      SequenceType = cs.createTypeVariable(Locator, TVO_CanBindToNoEscape);
       cs.addConstraint(ConstraintKind::Conversion, cs.getType(expr),
                        SequenceType, Locator);
       cs.addConstraint(ConstraintKind::ConformsTo, SequenceType,
                        sequenceProto->getDeclaredType(), Locator);
 
-      auto iteratorLocator =
-        cs.getConstraintLocator(Locator,
-                                ConstraintLocator::SequenceIteratorProtocol);
       auto elementLocator =
-        cs.getConstraintLocator(iteratorLocator,
-                                ConstraintLocator::GeneratorElementType);
+        cs.getConstraintLocator(Locator,
+                                ConstraintLocator::SequenceElementType);
 
       // Collect constraints from the element pattern.
       auto pattern = Stmt->getPattern();
       InitType = cs.generateConstraints(pattern, elementLocator);
       if (!InitType)
         return true;
-      
-      // Manually search for the iterator witness. If no iterator/element pair
-      // exists, solve for them.
-      Type iteratorType;
-      Type elementType;
-      
-      NameLookupOptions lookupOptions = defaultMemberTypeLookupOptions;
-      if (isa<AbstractFunctionDecl>(cs.DC))
-        lookupOptions |= NameLookupFlags::KnownPrivate;
-
-      auto sequenceType = cs.getType(expr)->getRValueType();
-
-      // Look through one level of optional; this improves recovery but doesn't
-      // change the result.
-      if (auto sequenceObjectType = sequenceType->getOptionalObjectType())
-        sequenceType = sequenceObjectType;
-
-      // If the sequence type is an existential, we should not attempt to
-      // look up the member type at all, since we cannot represent associated
-      // types of existentials.
-      //
-      // We will diagnose it later.
-      if (!sequenceType->isExistentialType() &&
-          (sequenceType->mayHaveMembers() ||
-           sequenceType->isTypeVariableOrMember())) {
-        ASTContext &ctx = tc.Context;
-        auto iteratorAssocType =
-          cast<AssociatedTypeDecl>(
-            sequenceProto->lookupDirect(ctx.Id_Iterator).front());
-
-        auto subs = sequenceType->getContextSubstitutionMap(
-          cs.DC->getParentModule(),
-          sequenceProto);
-        iteratorType = iteratorAssocType->getDeclaredInterfaceType()
-          .subst(subs);
-
-        if (iteratorType) {
-          auto iteratorProto =
-            tc.getProtocol(Stmt->getForLoc(),
-                           KnownProtocolKind::IteratorProtocol);
-          if (!iteratorProto)
-            return true;
-
-          auto elementAssocType =
-            cast<AssociatedTypeDecl>(
-              iteratorProto->lookupDirect(ctx.Id_Element).front());
-
-          elementType = iteratorType->getTypeOfMember(
-                          cs.DC->getParentModule(),
-                          elementAssocType,
-                          elementAssocType->getDeclaredInterfaceType());
-        }
-      }
-
-      if (elementType.isNull()) {
-        elementType = cs.createTypeVariable(elementLocator);
-      }
 
       // Add a conversion constraint between the element type of the sequence
       // and the type of the element pattern.
+      auto elementType = DependentMemberType::get(SequenceType, elementAssocType);
       cs.addConstraint(ConstraintKind::Conversion, elementType, InitType,
                        elementLocator);
 
@@ -2662,18 +2965,18 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
       SequenceType = solution.simplifyType(SequenceType);
 
       // Perform any necessary conversions of the sequence (e.g. [T]! -> [T]).
-      if (tc.convertToType(expr, SequenceType, cs.DC)) {
-        return nullptr;
-      }
+      expr = solution.coerceToType(expr, SequenceType, cs.getConstraintLocator(expr));
+      
+      if (!expr) return nullptr;
 
       cs.cacheExprTypes(expr);
 
       // Apply the solution to the iteration pattern as well.
       Pattern *pattern = Stmt->getPattern();
-      TypeResolutionOptions options = TypeResolutionFlags::OverrideType;
-      options |= TypeResolutionFlags::EnumerationVariable;
-      options |= TypeResolutionFlags::InExpression;
-      if (tc.coercePatternToType(pattern, cs.DC, InitType, options)) {
+      TypeResolutionOptions options(TypeResolverContext::ForEachStmt);
+      options |= TypeResolutionFlags::OverrideType;
+      if (tc.coercePatternToType(pattern, TypeResolution::forContextual(cs.DC),
+                                 InitType, options)) {
         return nullptr;
       }
 
@@ -2694,64 +2997,10 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
   return !resultTy;
 }
 
-/// \brief Compute the rvalue type of the given expression, which is the
-/// destination of an assignment statement.
-Type ConstraintSystem::computeAssignDestType(Expr *dest, SourceLoc equalLoc) {
-  if (auto *TE = dyn_cast<TupleExpr>(dest)) {
-    auto &ctx = getASTContext();
-    SmallVector<TupleTypeElt, 4> destTupleTypes;
-    for (unsigned i = 0; i != TE->getNumElements(); ++i) {
-      Expr *subExpr = TE->getElement(i);
-      Type elemTy = computeAssignDestType(subExpr, equalLoc);
-      if (!elemTy)
-        return Type();
-      destTupleTypes.push_back(TupleTypeElt(elemTy, TE->getElementName(i)));
-    }
-
-    return TupleType::get(destTupleTypes, ctx);
-  }
-
-  Type destTy = simplifyType(getType(dest));
-  if (destTy->hasError())
-    return Type();
-
-  // If we have already resolved a concrete lvalue destination type, return it.
-  if (LValueType *destLV = destTy->getAs<LValueType>())
-    return destLV->getObjectType();
-
-  // If the destination is a type variable, the type variable must be an
-  // lvalue type, which we enforce via an equality relationship with
-  // @lvalue T, where T is a fresh type variable that will be the object type of
-  // this particular expression type.
-  if (auto typeVar = dyn_cast<TypeVariableType>(destTy.getPointer())) {
-    // Newly allocated type should be explicitly materializable,
-    // it's invalid to use non-materializable types as assignment destination.
-    auto objectTv = createTypeVariable(getConstraintLocator(dest));
-    auto refTv = LValueType::get(objectTv);
-    addConstraint(ConstraintKind::Bind, typeVar, refTv,
-                  getConstraintLocator(dest));
-    return objectTv;
-  }
-
-  // Otherwise, the destination is erroneous.  If there are FixIt hints
-  // introduced into the system, they may well be the reason that this isn't an
-  // lvalue.  Emit them if present.
-  if (!Fixes.empty()) {
-    auto solution = finalize(FreeTypeVariableBinding::Allow);
-    if (applySolutionFixes(dest, solution))
-      return Type();
-  }
-
-  // Otherwise, it is a structural problem, diagnose that.
-  diagnoseAssignmentFailure(dest, destTy, equalLoc);
-  return Type();
-}
-
 bool TypeChecker::typeCheckCondition(Expr *&expr, DeclContext *dc) {
-  // If this expression is already typechecked and has an i1 type, then it has
-  // already got its conversion from Boolean back to i1.  Just re-typecheck
-  // it.
-  if (expr->getType() && expr->getType()->isBuiltinIntegerType(1)) {
+  // If this expression is already typechecked and has type Bool, then just
+  // re-typecheck it.
+  if (expr->getType() && expr->getType()->isBool()) {
     auto resultTy = typeCheckExpression(expr, dc);
     return !resultTy;
   }
@@ -2777,19 +3026,6 @@ bool TypeChecker::typeCheckCondition(Expr *&expr, DeclContext *dc) {
                        cs.getConstraintLocator(expr));
       return false;
     }
-
-    // Convert the result to a Builtin.i1.
-    Expr *appliedSolution(constraints::Solution &solution,
-                          Expr *expr) override {
-      auto &cs = solution.getConstraintSystem();
-
-      auto converted =
-        solution.convertBooleanTypeToBuiltinI1(expr,
-                                             cs.getConstraintLocator(OrigExpr));
-      cs.setExprTypes(converted);
-      return converted;
-    }
-    
   };
 
   ConditionListener listener;
@@ -2841,7 +3077,7 @@ bool TypeChecker::typeCheckStmtCondition(StmtCondition &cond, DeclContext *dc,
 
     // Check the pattern, it allows unspecified types because the pattern can
     // provide type information.
-    TypeResolutionOptions options = TypeResolutionFlags::InExpression;
+    TypeResolutionOptions options(TypeResolverContext::InExpression);
     options |= TypeResolutionFlags::AllowUnspecifiedTypes;
     options |= TypeResolutionFlags::AllowUnboundGenerics;
     if (typeCheckPattern(pattern, dc, options)) {
@@ -2852,8 +3088,7 @@ bool TypeChecker::typeCheckStmtCondition(StmtCondition &cond, DeclContext *dc,
     // If the pattern didn't get a type, it's because we ran into some
     // unknown types along the way. We'll need to check the initializer.
     auto init = elt.getInitializer();
-    hadError |= typeCheckBinding(pattern, init, dc,
-                                 /*skipApplyingSolution*/false);
+    hadError |= typeCheckBinding(pattern, init, dc);
     elt.setPattern(pattern);
     elt.setInitializer(init);
     hadAnyFalsable |= pattern->isRefutablePattern();
@@ -2872,16 +3107,17 @@ bool TypeChecker::typeCheckStmtCondition(StmtCondition &cond, DeclContext *dc,
 /// value of a given type.
 bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                        Type rhsType) {
+  FrontendStatsTracer StatsTracer(Context.Stats, "typecheck-expr-pattern", EP);
   PrettyStackTracePattern stackTrace(Context, "type-checking", EP);
 
   // Create a 'let' binding to stand in for the RHS value.
   auto *matchVar = new (Context) VarDecl(/*IsStatic*/false,
-                                         VarDecl::Specifier::Let,
+                                         VarDecl::Introducer::Let,
                                          /*IsCaptureList*/false,
                                          EP->getLoc(),
                                          Context.getIdentifier("$match"),
-                                         rhsType,
                                          DC);
+  matchVar->setType(rhsType);
   matchVar->setInterfaceType(rhsType->mapTypeOutOfContext());
 
   matchVar->setImplicit();
@@ -2946,11 +3182,19 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
         return found->second;
 
       if (auto archetypeType = dyn_cast<ArchetypeType>(origType)) {
-        if (archetypeType->getParent())
+        auto root = archetypeType->getRoot();
+        // We leave opaque types and their nested associated types alone here.
+        // They're globally available.
+        if (isa<OpaqueTypeArchetypeType>(root))
+          return origType;
+        // For other nested types, fail here so the default logic in subst()
+        // for nested types applies.
+        else if (root != archetypeType)
           return Type();
-
+        
         auto locator = cs.getConstraintLocator(nullptr);
-        auto replacement = cs.createTypeVariable(locator);
+        auto replacement = cs.createTypeVariable(locator,
+                                                 TVO_CanBindToNoEscape);
 
         if (auto superclass = archetypeType->getSuperclass()) {
           cs.addConstraint(ConstraintKind::Subtype, replacement,
@@ -2967,7 +3211,8 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
       // FIXME: Remove this case
       assert(cast<GenericTypeParamType>(origType));
       auto locator = cs.getConstraintLocator(nullptr);
-      auto replacement = cs.createTypeVariable(locator);
+      auto replacement = cs.createTypeVariable(locator,
+                                               TVO_CanBindToNoEscape);
       types[origType] = replacement;
       return replacement;
     },
@@ -3006,21 +3251,6 @@ bool TypeChecker::typesSatisfyConstraint(Type type1, Type type2,
 }
 
 bool TypeChecker::isSubtypeOf(Type type1, Type type2, DeclContext *dc) {
-  return typesSatisfyConstraint(type1, type2,
-                                /*openArchetypes=*/false,
-                                ConstraintKind::Subtype, dc);
-}
-
-bool TypeChecker::isSubclassOf(Type type1, Type type2, DeclContext *dc) {
-  assert(type2->getClassOrBoundGenericClass());
-
-  if (!typesSatisfyConstraint(type1,
-                              Context.getAnyObjectType(),
-                              /*openArchetypes=*/false,
-                              ConstraintKind::ConformsTo, dc)) {
-    return false;
-  }
-
   return typesSatisfyConstraint(type1, type2,
                                 /*openArchetypes=*/false,
                                 ConstraintKind::Subtype, dc);
@@ -3129,15 +3359,11 @@ Expr *TypeChecker::coerceToRValue(Expr *expr,
     return FVE;
   }
 
-  // Load lvalues.
-  if (auto lvalue = exprTy->getAs<LValueType>())
-    return addImplicitLoadExpr(expr, getType, setType);
-
   // Walk into parenthesized expressions to update the subexpression.
   if (auto paren = dyn_cast<IdentityExpr>(expr)) {
     auto sub =  coerceToRValue(paren->getSubExpr(), getType, setType);
     paren->setSubExpr(sub);
-    setType(paren, getType(sub));
+    setType(paren, ParenType::get(Context, getType(sub)));
     return paren;
   }
 
@@ -3181,6 +3407,10 @@ Expr *TypeChecker::coerceToRValue(Expr *expr,
     return tuple;
   }
 
+  // Load lvalues.
+  if (exprTy->is<LValueType>())
+    return addImplicitLoadExpr(expr, getType, setType);
+
   // Nothing to do.
   return expr;
 }
@@ -3190,6 +3420,11 @@ bool TypeChecker::convertToType(Expr *&expr, Type type, DeclContext *dc,
   // TODO: need to add kind arg?
   // Construct a constraint system from this expression.
   ConstraintSystem cs(*this, dc, ConstraintSystemFlags::AllowFixes);
+    
+  // Cache the expression type on the system to ensure it is available
+  // on diagnostics if the convertion fails.
+  cs.cacheExprTypes(expr);
+
   // If there is a type that we're expected to convert to, add the conversion
   // constraint.
   cs.addConstraint(ConstraintKind::Conversion, expr->getType(), type,
@@ -3198,7 +3433,7 @@ bool TypeChecker::convertToType(Expr *&expr, Type type, DeclContext *dc,
   if (getLangOpts().DebugConstraintSolver) {
     auto &log = Context.TypeCheckerDebug->getStream();
     log << "---Initial constraints for the given expression---\n";
-    expr->print(log);
+    expr->dump(log);
     log << "\n";
     cs.print(log);
   }
@@ -3234,6 +3469,7 @@ bool TypeChecker::convertToType(Expr *&expr, Type type, DeclContext *dc,
     auto &log = Context.TypeCheckerDebug->getStream();
     log << "---Type-checked expression---\n";
     result->dump(log);
+    log << "\n";
   }
 
   expr = result;
@@ -3305,6 +3541,7 @@ void Solution::dump(raw_ostream &out) const {
       break;
 
     case OverloadChoiceKind::DynamicMemberLookup:
+    case OverloadChoiceKind::KeyPathDynamicMemberLookup:
       out << "dynamic member lookup root "
           << choice.getBaseType()->getString()
           << " name='" << choice.getName() << "'\n";
@@ -3373,11 +3610,9 @@ void Solution::dump(raw_ostream &out) const {
 
   if (!Fixes.empty()) {
     out << "\nFixes:\n";
-    for (auto &fix : Fixes) {
+    for (auto *fix : Fixes) {
       out.indent(2);
-      fix.first.print(out, &getConstraintSystem());
-      out << " @ ";
-      fix.second->dump(sm, out);
+      fix->print(out);
       out << "\n";
     }
   }
@@ -3388,6 +3623,10 @@ void ConstraintSystem::dump() {
 }
 
 void ConstraintSystem::dump(Expr *E) {
+  print(llvm::errs(), E);
+}
+
+void ConstraintSystem::print(raw_ostream &out, Expr *E) {
   auto getTypeOfExpr = [&](const Expr *E) -> Type {
     if (hasType(E))
       return getType(E);
@@ -3398,8 +3637,14 @@ void ConstraintSystem::dump(Expr *E) {
       return getType(TL);
     return Type();
   };
+  auto getTypeOfKeyPathComponent =
+      [&](const KeyPathExpr *KP, unsigned I) -> Type {
+    if (hasType(KP, I))
+      return getType(KP, I);
+    return Type();
+  };
 
-  E->dump(getTypeOfExpr, getTypeOfTypeLoc);
+  E->dump(out, getTypeOfExpr, getTypeOfTypeLoc, getTypeOfKeyPathComponent);
 }
 
 void ConstraintSystem::print(raw_ostream &out) {
@@ -3426,6 +3671,8 @@ void ConstraintSystem::print(raw_ostream &out) {
       out << " [lvalue allowed]";
     if (tv->getImpl().canBindToInOut())
       out << " [inout allowed]";
+    if (tv->getImpl().canBindToNoEscape())
+      out << " [noescape allowed]";
     auto rep = getRepresentative(tv);
     if (rep == tv) {
       if (auto fixed = getFixedType(tv)) {
@@ -3500,6 +3747,7 @@ void ConstraintSystem::print(raw_ostream &out) {
         break;
 
       case OverloadChoiceKind::DynamicMemberLookup:
+      case OverloadChoiceKind::KeyPathDynamicMemberLookup:
         out << "dynamic member lookup:"
             << choice.getBaseType()->getString() << "  name="
             << choice.getName() << "\n";
@@ -3570,11 +3818,9 @@ void ConstraintSystem::print(raw_ostream &out) {
 
   if (!Fixes.empty()) {
     out << "\nFixes:\n";
-    for (auto &fix : Fixes) {
+    for (auto *fix : Fixes) {
       out.indent(2);
-      fix.first.print(out, this);
-      out << " @ ";
-      fix.second->dump(&getTypeChecker().Context.SourceMgr, out);
+      fix->print(out);
       out << "\n";
     }
   }
@@ -3906,6 +4152,53 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     }
   }
 
+  assert(!toType->isAny() && "casts to 'Any' should've been handled above");
+  assert(!toType->isAnyObject() &&
+         "casts to 'AnyObject' should've been handled above");
+
+  // A cast from a function type to an existential type (except `Any`)
+  // or an archetype type (with constraints) cannot succeed
+  auto toArchetypeType = toType->is<ArchetypeType>();
+  auto fromFunctionType = fromType->is<FunctionType>();
+  auto toExistentialType = toType->isAnyExistentialType();
+
+  auto toConstrainedArchetype = false;
+  if (toArchetypeType) {
+    auto archetype = toType->castTo<ArchetypeType>();
+    toConstrainedArchetype = !archetype->getConformsTo().empty();
+  }
+
+  if (fromFunctionType &&
+      (toExistentialType || (toArchetypeType && toConstrainedArchetype))) {
+    switch (contextKind) {
+    case CheckedCastContextKind::ConditionalCast:
+    case CheckedCastContextKind::ForcedCast:
+      diagnose(diagLoc, diag::downcast_to_unrelated, origFromType, origToType)
+          .highlight(diagFromRange)
+          .highlight(diagToRange);
+
+      // If we're referring to a function with a return value (not Void) then
+      // emit a fix-it suggesting to add `()` to call the function
+      if (auto DRE = dyn_cast<DeclRefExpr>(fromExpr)) {
+        if (auto FD = dyn_cast<FuncDecl>(DRE->getDecl())) {
+          if (!FD->getResultInterfaceType()->isVoid()) {
+            diagnose(diagLoc, diag::downcast_to_unrelated_fixit, FD->getName())
+                .fixItInsertAfter(fromExpr->getEndLoc(), "()");
+          }
+        }
+      }
+
+      return CheckedCastKind::ValueCast;
+      break;
+
+    case CheckedCastContextKind::IsPattern:
+    case CheckedCastContextKind::EnumElementPattern:
+    case CheckedCastContextKind::IsExpr:
+    case CheckedCastContextKind::None:
+      break;
+    }
+  }
+
   // If we can bridge through an Objective-C class, do so.
   if (Type bridgedToClass = getDynamicBridgedThroughObjCClass(dc, fromType,
                                                               toType)) {
@@ -3990,6 +4283,33 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     // Cast to and from AnyObject always succeed.
     if (toType->isAnyObject() || fromType->isAnyObject())
       return CheckedCastKind::ValueCast;
+
+    // A cast from an existential type to a concrete type does not succeed. For
+    // example:
+    //
+    // struct S {}
+    // enum FooError: Error { case bar }
+    //
+    // func foo() {
+    //   do {
+    //     throw FooError.bar
+    //   } catch is X { /* Will always fail */
+    //     print("Caught bar error")
+    //   }
+    // }
+    if (fromExistential) {
+      if (auto NTD = toType->getAnyNominal()) {
+        if (!isa<ProtocolDecl>(NTD)) {
+          auto protocolDecl =
+              dyn_cast_or_null<ProtocolDecl>(fromType->getAnyNominal());
+          if (protocolDecl &&
+              !conformsToProtocol(toType, protocolDecl, dc,
+                                  ConformanceCheckFlags::InExpression)) {
+            return failed();
+          }
+        }
+      }
+    }
 
     bool toRequiresClass;
     if (toType->isExistentialType())
@@ -4103,8 +4423,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
   if (Context.LangOpts.EnableObjCInterop) {
     if (auto errorTypeProto = Context.getProtocol(KnownProtocolKind::Error)) {
       if (conformsToProtocol(toType, errorTypeProto, dc,
-                             (ConformanceCheckFlags::InExpression|
-                              ConformanceCheckFlags::Used))) {
+                             ConformanceCheckFlags::InExpression)) {
         auto nsError = Context.getNSErrorDecl();
         if (nsError) {
           if (!nsError->hasInterfaceType()) {
@@ -4153,8 +4472,8 @@ static Expr *lookThroughBridgeFromObjCCall(ASTContext &ctx, Expr *expr) {
   if (!callee)
     return nullptr;
 
-  if (callee == ctx.getForceBridgeFromObjectiveC(nullptr) ||
-      callee == ctx.getConditionallyBridgeFromObjectiveC(nullptr))
+  if (callee == ctx.getForceBridgeFromObjectiveC() ||
+      callee == ctx.getConditionallyBridgeFromObjectiveC())
     return cast<TupleExpr>(call->getArg())->getElement(0);
 
   return nullptr;

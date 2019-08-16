@@ -91,6 +91,17 @@ NSStringAPIs.test("NSStringEncoding") {
   expectEqual(.utf8, enc)
 }
 
+NSStringAPIs.test("NSStringEncoding.Hashable") {
+  let instances: [String.Encoding] = [
+    .windowsCP1250,
+    .utf32LittleEndian,
+    .utf32BigEndian,
+    .ascii,
+    .utf8,
+  ]
+  checkHashable(instances, equalityOracle: { $0 == $1 })
+}
+
 NSStringAPIs.test("localizedStringWithFormat(_:...)") {
   let world: NSString = "world"
   expectEqual("Hello, world!%42", String.localizedStringWithFormat(
@@ -199,7 +210,7 @@ NSStringAPIs.test("init(contentsOf:usedEncoding:error:)") {
 }
 
 NSStringAPIs.test("init(cString_:encoding:)") {
-  expectOptionalEqual("foo, a basmati bar!",
+  expectEqual("foo, a basmati bar!",
       String(cString: 
           "foo, a basmati bar!", encoding: String.defaultCStringEncoding))
 }
@@ -215,7 +226,7 @@ NSStringAPIs.test("init(utf8String:)") {
   up[i] = 0
   let cstr = UnsafeMutableRawPointer(up)
     .bindMemory(to: CChar.self, capacity: 100)
-  expectOptionalEqual(s, String(utf8String: cstr))
+  expectEqual(s, String(utf8String: cstr))
   up.deallocate()
 }
 
@@ -687,6 +698,18 @@ NSStringAPIs.test("getBytes(_:maxLength:usedLength:encoding:options:range:remain
 NSStringAPIs.test("getCString(_:maxLength:encoding:)") {
   let s = "abc あかさた"
   do {
+    // A significantly too small buffer
+    let bufferLength = 1
+    var buffer = Array(
+      repeating: CChar(bitPattern: 0xff), count: bufferLength)
+    let result = s.getCString(&buffer, maxLength: 100,
+                              encoding: .utf8)
+    expectFalse(result)
+    let result2 = s.getCString(&buffer, maxLength: 1,
+                              encoding: .utf8)
+    expectFalse(result2)
+  }
+  do {
     // The largest buffer that cannot accommodate the string plus null terminator.
     let bufferLength = 16
     var buffer = Array(
@@ -694,6 +717,9 @@ NSStringAPIs.test("getCString(_:maxLength:encoding:)") {
     let result = s.getCString(&buffer, maxLength: 100,
       encoding: .utf8)
     expectFalse(result)
+    let result2 = s.getCString(&buffer, maxLength: 16,
+                              encoding: .utf8)
+    expectFalse(result2)
   }
   do {
     // The smallest buffer where the result can fit.
@@ -707,6 +733,10 @@ NSStringAPIs.test("getCString(_:maxLength:encoding:)") {
     let result = s.getCString(&buffer, maxLength: 100,
       encoding: .utf8)
     expectTrue(result)
+    expectEqualSequence(expectedStr, buffer)
+    let result2 = s.getCString(&buffer, maxLength: 17,
+                              encoding: .utf8)
+    expectTrue(result2)
     expectEqualSequence(expectedStr, buffer)
   }
   do {
@@ -770,7 +800,7 @@ NSStringAPIs.test("hash") {
 
 NSStringAPIs.test("init(bytes:encoding:)") {
   var s: String = "abc あかさた"
-  expectOptionalEqual(
+  expectEqual(
     s, String(bytes: s.utf8, encoding: .utf8))
 
   /*
@@ -787,7 +817,7 @@ NSStringAPIs.test("init(bytes:encoding:)") {
 NSStringAPIs.test("init(bytesNoCopy:length:encoding:freeWhenDone:)") {
   var s: String = "abc あかさた"
   var bytes: [UInt8] = Array(s.utf8)
-  expectOptionalEqual(s, String(bytesNoCopy: &bytes,
+  expectEqual(s, String(bytesNoCopy: &bytes,
       length: bytes.count, encoding: .utf8,
       freeWhenDone: false))
 
@@ -1174,12 +1204,12 @@ NSStringAPIs.test("range(of:options:range:locale:)") {
     let s = "abc"
     expectNil(s.range(of: ""))
     expectNil(s.range(of: "def"))
-    expectOptionalEqual(0..<3, toIntRange(s, s.range(of: "abc")))
+    expectEqual(0..<3, toIntRange(s, s.range(of: "abc")))
   }
   do {
     let s = "さ\u{3099}し\u{3099}す\u{3099}せ\u{3099}そ\u{3099}"
-    expectOptionalEqual(2..<3, toIntRange(s, s.range(of: "す\u{3099}")))
-    expectOptionalEqual(2..<3, toIntRange(s, s.range(of: "\u{305a}")))
+    expectEqual(2..<3, toIntRange(s, s.range(of: "す\u{3099}")))
+    expectEqual(2..<3, toIntRange(s, s.range(of: "\u{305a}")))
 
     expectNil(s.range(of: "\u{3099}す"))
     expectNil(s.range(of: "す"))
@@ -1194,8 +1224,8 @@ NSStringAPIs.test("range(of:options:range:locale:)") {
   }
   do {
     let s = "а\u{0301}б\u{0301}в\u{0301}г\u{0301}"
-    expectOptionalEqual(0..<1, toIntRange(s, s.range(of: "а\u{0301}")))
-    expectOptionalEqual(1..<2, toIntRange(s, s.range(of: "б\u{0301}")))
+    expectEqual(0..<1, toIntRange(s, s.range(of: "а\u{0301}")))
+    expectEqual(1..<2, toIntRange(s, s.range(of: "б\u{0301}")))
 
     expectNil(s.range(of: "б"))
     expectNil(s.range(of: "\u{0301}б"))
@@ -1347,10 +1377,10 @@ func getHomeDir() -> String {
 }
 
 NSStringAPIs.test("addingPercentEncoding(withAllowedCharacters:)") {
-  expectOptionalEqual(
+  expectEqual(
     "abcd1234",
     "abcd1234".addingPercentEncoding(withAllowedCharacters: .alphanumerics))
-  expectOptionalEqual(
+  expectEqual(
     "abcd%20%D0%B0%D0%B1%D0%B2%D0%B3",
     "abcd абвг".addingPercentEncoding(withAllowedCharacters: .alphanumerics))
 }
@@ -1545,19 +1575,19 @@ NSStringAPIs.test("replacingOccurrences(of:with:options:range:)") {
 }
 
 NSStringAPIs.test("removingPercentEncoding") {
-  expectOptionalEqual(
+  expectEqual(
     "abcd абвг",
     "abcd абвг".removingPercentEncoding)
 
-  expectOptionalEqual(
+  expectEqual(
     "abcd абвг\u{0000}\u{0001}",
     "abcd абвг%00%01".removingPercentEncoding)
 
-  expectOptionalEqual(
+  expectEqual(
     "abcd абвг",
     "%61%62%63%64%20%D0%B0%D0%B1%D0%B2%D0%B3".removingPercentEncoding)
 
-  expectOptionalEqual(
+  expectEqual(
     "abcd абвг",
     "ab%63d %D0%B0%D0%B1%D0%B2%D0%B3".removingPercentEncoding)
 
@@ -1575,7 +1605,7 @@ NSStringAPIs.test("removingPercentEncoding/OSX 10.9")
   .xfail(.iOSMajor(7, reason: "same bug in Foundation in iOS 7.*"))
   .skip(.iOSSimulatorAny("same bug in Foundation in iOS Simulator 7.*"))
   .code {
-  expectOptionalEqual("", "".removingPercentEncoding)
+  expectEqual("", "".removingPercentEncoding)
 }
 
 NSStringAPIs.test("trimmingCharacters(in:)") {

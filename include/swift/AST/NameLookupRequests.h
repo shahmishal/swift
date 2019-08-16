@@ -17,12 +17,14 @@
 #define SWIFT_NAME_LOOKUP_REQUESTS_H
 
 #include "swift/AST/SimpleRequest.h"
+#include "swift/AST/ASTTypeIDs.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/TinyPtrVector.h"
 
 namespace swift {
 
 class ClassDecl;
+class DestructorDecl;
 class TypeAliasDecl;
 class TypeDecl;
 
@@ -55,10 +57,10 @@ using DirectlyReferencedTypeDecls = llvm::TinyPtrVector<TypeDecl *>;
 /// The inherited declaration of \c D at index 1 is the typealias Alias.
 class InheritedDeclsReferencedRequest :
   public SimpleRequest<InheritedDeclsReferencedRequest,
-                       CacheKind::Uncached, // FIXME: Cache these
-                       DirectlyReferencedTypeDecls,
-                       llvm::PointerUnion<TypeDecl *, ExtensionDecl *>,
-                       unsigned>
+                       DirectlyReferencedTypeDecls(
+                         llvm::PointerUnion<TypeDecl *, ExtensionDecl *>,
+                         unsigned),
+                       CacheKind::Uncached> // FIXME: Cache these
 {
   /// Retrieve the TypeLoc for this inherited type.
   TypeLoc &getTypeLoc(llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl,
@@ -68,7 +70,7 @@ public:
   using SimpleRequest::SimpleRequest;
 
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
   DirectlyReferencedTypeDecls evaluate(
@@ -80,10 +82,8 @@ public:
   // Caching
   bool isCached() const { return true; }
 
-  // Cycle handling
-  DirectlyReferencedTypeDecls breakCycle() const { return { }; }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
+  // Source location information.
+  SourceLoc getNearestLoc() const;
 };
 
 /// Request the set of declarations directly referenced by the underlying
@@ -107,15 +107,14 @@ public:
 /// using another instance of this request.
 class UnderlyingTypeDeclsReferencedRequest :
   public SimpleRequest<UnderlyingTypeDeclsReferencedRequest,
-                       CacheKind::Uncached, // FIXME: Cache these
-                       DirectlyReferencedTypeDecls,
-                       TypeAliasDecl *>
+                       DirectlyReferencedTypeDecls(TypeAliasDecl *),
+                       CacheKind::Uncached> // FIXME: Cache these
 {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
   DirectlyReferencedTypeDecls evaluate(
@@ -125,36 +124,134 @@ private:
 public:
   // Caching
   bool isCached() const { return true; }
-
-  // Cycle handling
-  DirectlyReferencedTypeDecls breakCycle() const { return { }; }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
 };
 
 /// Request the superclass declaration for the given class.
 class SuperclassDeclRequest :
     public SimpleRequest<SuperclassDeclRequest,
-                         CacheKind::Uncached, // FIXME: Cache these
-                         ClassDecl *,
-                         NominalTypeDecl *> {
+                         ClassDecl *(NominalTypeDecl *),
+                         CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
-  friend class SimpleRequest;
+  friend SimpleRequest;
 
   // Evaluation.
-  ClassDecl *evaluate(Evaluator &evaluator, NominalTypeDecl *subject) const;
+  llvm::Expected<ClassDecl *>
+  evaluate(Evaluator &evaluator, NominalTypeDecl *subject) const;
 
 public:
   // Caching
   bool isCached() const { return true; }
+  Optional<ClassDecl *> getCachedResult() const;
+  void cacheResult(ClassDecl *value) const;
+};
 
-  // Cycle handling
-  ClassDecl *breakCycle() const { return nullptr; }
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
+/// Request the nominal declaration extended by a given extension declaration.
+class ExtendedNominalRequest :
+    public SimpleRequest<ExtendedNominalRequest,
+                         NominalTypeDecl *(ExtensionDecl *),
+                         CacheKind::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::Expected<NominalTypeDecl *>
+  evaluate(Evaluator &evaluator, ExtensionDecl *ext) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  Optional<NominalTypeDecl *> getCachedResult() const;
+  void cacheResult(NominalTypeDecl *value) const;
+};
+
+struct SelfBounds {
+  llvm::TinyPtrVector<NominalTypeDecl *> decls;
+  bool anyObject = false;
+};
+
+/// Request the nominal types that occur as the right-hand side of "Self: Foo"
+/// constraints in the "where" clause of a protocol extension.
+class SelfBoundsFromWhereClauseRequest :
+    public SimpleRequest<SelfBoundsFromWhereClauseRequest,
+                         SelfBounds(llvm::PointerUnion<TypeDecl *,
+                                                       ExtensionDecl *>),
+                         CacheKind::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  SelfBounds evaluate(Evaluator &evaluator,
+                      llvm::PointerUnion<TypeDecl *, ExtensionDecl *>) const;
+};
+
+
+/// Request all type aliases and nominal types that appear in the "where"
+/// clause of an extension.
+class TypeDeclsFromWhereClauseRequest :
+    public SimpleRequest<TypeDeclsFromWhereClauseRequest,
+                         DirectlyReferencedTypeDecls(ExtensionDecl *),
+                         CacheKind::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  DirectlyReferencedTypeDecls evaluate(Evaluator &evaluator,
+                                       ExtensionDecl *ext) const;
+};
+
+/// Request the nominal type declaration to which the given custom attribute
+/// refers.
+class CustomAttrNominalRequest :
+    public SimpleRequest<CustomAttrNominalRequest,
+                         NominalTypeDecl *(CustomAttr *, DeclContext *),
+                         CacheKind::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::Expected<NominalTypeDecl *>
+  evaluate(Evaluator &evaluator, CustomAttr *attr, DeclContext *dc) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+};
+
+/// Finds or synthesizes a destructor for the given class.
+class GetDestructorRequest :
+    public SimpleRequest<GetDestructorRequest,
+                         DestructorDecl *(ClassDecl *),
+                         CacheKind::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::Expected<DestructorDecl *>
+  evaluate(Evaluator &evaluator, ClassDecl *classDecl) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+  Optional<DestructorDecl *> getCachedResult() const;
+  void cacheResult(DestructorDecl *value) const;
 };
 
 /// The zone number for name-lookup requests.

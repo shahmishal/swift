@@ -20,22 +20,22 @@
 import Typedefs
 import Lib
 
-// CHECK-SIL-LABEL: sil hidden @$S8typedefs11testSymbolsyyF
+// CHECK-SIL-LABEL: sil hidden [ossa] @$s8typedefs11testSymbolsyyF
 func testSymbols() {
   // Check that the symbols are not using 'Bool'.
-  // CHECK-SIL: function_ref @$S3Lib1xs5Int32Vvau
+  // CHECK-SIL: function_ref @$s3Lib1xs5Int32Vvau
   _ = Lib.x
-  // CHECK-SIL: function_ref @$S3Lib9usesAssocs5Int32VSgvau
+  // CHECK-SIL: function_ref @$s3Lib9usesAssocs5Int32VSgvau
   _ = Lib.usesAssoc
-} // CHECK-SIL: end sil function '$S8typedefs11testSymbolsyyF'
+} // CHECK-SIL: end sil function '$s8typedefs11testSymbolsyyF'
 
-// CHECK-IR-LABEL: define{{.*}} void @"$S8typedefs18testVTableBuilding4usery3Lib4UserC_tF
+// CHECK-IR-LABEL: define{{.*}} void @"$s8typedefs18testVTableBuilding4usery3Lib4UserC_tF
 public func testVTableBuilding(user: User) {
-  // The important thing in this CHECK line is the "i64 30", which is the offset
+  // The important thing in this CHECK line is the "i64 28", which is the offset
   // for the vtable slot for 'lastMethod()'. If the layout here
   // changes, please check that offset is still correct.
   // CHECK-IR-NOT: ret
-  // CHECK-IR: getelementptr inbounds void (%T3Lib4UserC*)*, void (%T3Lib4UserC*)** %{{[0-9]+}}, {{i64 30|i32 33}}
+  // CHECK-IR: getelementptr inbounds void (%T3Lib4UserC*)*, void (%T3Lib4UserC*)** %{{[0-9]+}}, {{i64 28|i32 31}}
   _ = user.lastMethod()
 } // CHECK-IR: ret void
 
@@ -100,31 +100,29 @@ open class User {
   // CHECK-RECOVERY: var unwrappedProp: Int32?
   public var unwrappedProp: UnwrappedInt?
   // CHECK: var wrappedProp: WrappedInt?
-  // CHECK-RECOVERY: /* placeholder for _ */
-  // CHECK-RECOVERY: /* placeholder for _ */
-  // CHECK-RECOVERY: /* placeholder for _ */
+  // CHECK_RECOVERY: /* placeholder for wrappedProp (vtable entries: 3) (field offsets: 1) */
   public var wrappedProp: WrappedInt?
 
   // CHECK: func returnsUnwrappedMethod() -> UnwrappedInt
   // CHECK-RECOVERY: func returnsUnwrappedMethod() -> Int32
   public func returnsUnwrappedMethod() -> UnwrappedInt { fatalError() }
   // CHECK: func returnsWrappedMethod() -> WrappedInt
-  // CHECK-RECOVERY: /* placeholder for returnsWrappedMethod() */
+  // CHECK-RECOVERY: /* placeholder for returnsWrappedMethod() (vtable entries: 1) */
   public func returnsWrappedMethod() -> WrappedInt { fatalError() }
 
   // CHECK: func constrainedUnwrapped<T>(_: T) where T : HasAssoc, T.Assoc == UnwrappedInt
   // CHECK-RECOVERY: func constrainedUnwrapped<T>(_: T) where T : HasAssoc, T.Assoc == Int32
   public func constrainedUnwrapped<T: HasAssoc>(_: T) where T.Assoc == UnwrappedInt { fatalError() }
   // CHECK: func constrainedWrapped<T>(_: T) where T : HasAssoc, T.Assoc == WrappedInt
-  // CHECK-RECOVERY: /* placeholder for constrainedWrapped(_:) */
+  // CHECK-RECOVERY: /* placeholder for constrainedWrapped(_:) (vtable entries: 1) */
   public func constrainedWrapped<T: HasAssoc>(_: T) where T.Assoc == WrappedInt { fatalError() }
 
   // CHECK: subscript(_: WrappedInt) -> () { get }
-  // CHECK-RECOVERY: /* placeholder for _ */
+  // CHECK-RECOVERY: /* placeholder for subscript(_:) (vtable entries: 1) */
   public subscript(_: WrappedInt) -> () { return () }
 
   // CHECK: subscript<T>(_: T) -> () where T : HasAssoc, T.Assoc == WrappedInt { get }
-  // CHECK-RECOVERY: /* placeholder for _ */
+  // CHECK-RECOVERY: /* placeholder for subscript(_:) (vtable entries: 1) */
   public subscript<T: HasAssoc>(_: T) -> () where T.Assoc == WrappedInt { return () }
 
   // CHECK: init()
@@ -132,7 +130,7 @@ open class User {
   public init() {}
 
   // CHECK: init(wrapped: WrappedInt)
-  // CHECK-RECOVERY: /* placeholder for init(wrapped:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrapped:) (vtable entries: 1) */
   public init(wrapped: WrappedInt) {}
 
   // CHECK: convenience init(conveniently: Int)
@@ -144,11 +142,11 @@ open class User {
   public convenience init<T: HasAssoc>(generic: T) where T.Assoc == WrappedInt { self.init() }
 
   // CHECK: required init(wrappedRequired: WrappedInt)
-  // CHECK-RECOVERY: /* placeholder for init(wrappedRequired:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrappedRequired:) (vtable entries: 1) */
   public required init(wrappedRequired: WrappedInt) {}
 
   // CHECK: {{^}} init(wrappedRequiredInSub: WrappedInt)
-  // CHECK-RECOVERY: /* placeholder for init(wrappedRequiredInSub:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrappedRequiredInSub:) (vtable entries: 1) */
   public init(wrappedRequiredInSub: WrappedInt) {}
 
   // CHECK: dynamic init(wrappedDynamic: WrappedInt)
@@ -170,25 +168,21 @@ open class User {
 // (10 words of normal class metadata on 64-bit platforms, 13 on 32-bit)
 // 10 CHECK-VTABLE-NEXT: #User.unwrappedProp!getter.1:
 // 11 CHECK-VTABLE-NEXT: #User.unwrappedProp!setter.1:
-// 12 CHECK-VTABLE-NEXT: #User.unwrappedProp!materializeForSet.1:
+// 12 CHECK-VTABLE-NEXT: #User.unwrappedProp!modify.1:
 // 13 CHECK-VTABLE-NEXT: #User.wrappedProp!getter.1:
 // 14 CHECK-VTABLE-NEXT: #User.wrappedProp!setter.1:
-// 15 CHECK-VTABLE-NEXT: #User.wrappedProp!materializeForSet.1:
+// 15 CHECK-VTABLE-NEXT: #User.wrappedProp!modify.1:
 // 16 CHECK-VTABLE-NEXT: #User.returnsUnwrappedMethod!1:
 // 17 CHECK-VTABLE-NEXT: #User.returnsWrappedMethod!1:
 // 18 CHECK-VTABLE-NEXT: #User.constrainedUnwrapped!1:
 // 19 CHECK-VTABLE-NEXT: #User.constrainedWrapped!1:
 // 20 CHECK-VTABLE-NEXT: #User.subscript!getter.1:
 // 21 CHECK-VTABLE-NEXT: #User.subscript!getter.1:
-// 22 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 23 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 24 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 25 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 26 CHECK-VTABLE-NEXT: #User.init!allocator.1:
-// 27 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 28 CHECK-VTABLE-NEXT: #User.init!initializer.1:
-// 29 CHECK-VTABLE-NEXT: #User.init!allocator.1:
-// 30 CHECK-VTABLE-NEXT: #User.lastMethod!1:
+// 22 CHECK-VTABLE-NEXT: #User.init!allocator.1:
+// 23 CHECK-VTABLE-NEXT: #User.init!allocator.1:
+// 24 CHECK-VTABLE-NEXT: #User.init!allocator.1:
+// 25 CHECK-VTABLE-NEXT: #User.init!allocator.1:
+// 26 CHECK-VTABLE-NEXT: #User.lastMethod!1:
 // CHECK-VTABLE: }
 
 
@@ -251,15 +245,15 @@ open class UserDynamicConvenience {
 // CHECK-RECOVERY-LABEL: class UserSub
 open class UserSub : User {
   // CHECK: init(wrapped: WrappedInt?)
-  // CHECK-RECOVERY: /* placeholder for init(wrapped:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrapped:) (vtable entries: 1) */
   public override init(wrapped: WrappedInt?) { super.init() }
 
   // CHECK: required init(wrappedRequired: WrappedInt?)
-  // CHECK-RECOVERY: /* placeholder for init(wrappedRequired:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrappedRequired:) (vtable entries: 1) */
   public required init(wrappedRequired: WrappedInt?) { super.init() }
 
   // CHECK: required init(wrappedRequiredInSub: WrappedInt?)
-  // CHECK-RECOVERY: /* placeholder for init(wrappedRequiredInSub:) */
+  // CHECK-RECOVERY: /* placeholder for init(wrappedRequiredInSub:) (vtable entries: 1) */
   public required override init(wrappedRequiredInSub: WrappedInt?) { super.init() }
 
   // CHECK: required init(wrappedRequiredDynamic: WrappedInt)
