@@ -11,4 +11,5 @@ jobs:
     runs-on: macOS-latest
     steps:
     - uses: actions/checkout@v1
-    - run: echo "Hi"
+    - run: sw_vers
+    - run: "ls -al /Applications/"
