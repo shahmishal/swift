@@ -14,4 +14,4 @@ jobs:
     - run: sw_vers
     - run: "ls -al /Applications/"
     - run: "xcode-select -p"
-    - run: "sudo xcode-select /Applications/Xcode.app"
+    - run: "sudo xcode-select -p /Applications/Xcode.app"
