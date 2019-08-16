@@ -19,3 +19,4 @@ jobs:
     - run: "xcodebuild -version"
     - run: "brew install cmake"
     - run: "./utils/update-checkout --skip-repository swift --scheme master --clone"
+    - run: "./utils/build-script --preset=buildbot_incremental,tools=RA,stdlib=RD,smoketest=macosx"
