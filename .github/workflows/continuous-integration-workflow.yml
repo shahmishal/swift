@@ -13,5 +13,6 @@ jobs:
     - uses: actions/checkout@v1
     - run: sw_vers
     - run: "ls -al /Applications/"
+    - run: "system_profiler SPHardwareDataType"
     - run: "xcode-select -p"
     - run: "sudo xcode-select -p /Applications/Xcode.app"
