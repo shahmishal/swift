@@ -12,5 +12,6 @@ jobs:
     steps:
     - uses: actions/checkout@v1
     - run: sudo lshw -short
+    - run: lscpu | grep 'CPU(s)'
     - run: sudo apt-get install inxi
     - run: inxi -F
