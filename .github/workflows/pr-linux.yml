@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-18.04
     steps:
     - uses: actions/checkout@v1
-    - run: sudo at /proc/cpuinfo
     - run: sudo lshw -short
     - run: sudo apt-get install inxi
     - run: inxi -F
