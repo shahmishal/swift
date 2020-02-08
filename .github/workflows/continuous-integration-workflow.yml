@@ -11,4 +11,10 @@ jobs:
     runs-on: macOS-latest
     steps:
     - uses: actions/checkout@v1
-    - run: echo "Hi"
+    - run: sw_vers
+    - run: "system_profiler SPHardwareDataType"
+    - run: "sudo xcode-select -s /Applications/Xcode_11_beta.app"
+    - run: "xcodebuild -version"
+    - run: "brew install cmake"
+    - run: "./utils/update-checkout --skip-repository swift --scheme master --clone"
+    - run: "./utils/build-script --preset=buildbot_incremental,tools=RA,stdlib=RD,smoketest=macosx"
