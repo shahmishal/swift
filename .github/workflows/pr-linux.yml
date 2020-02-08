@@ -15,3 +15,4 @@ jobs:
     - run: lscpu | grep 'CPU(s)'
     - run: sudo apt-get install inxi
     - run: inxi -F
+    - run: whoami
