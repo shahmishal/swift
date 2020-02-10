@@ -10,7 +10,7 @@ jobs:
     name: Swift Linux (Ubuntu 18.04)
     runs-on: ubuntu-18.04
     steps:
-    - uses: actions/checkout
+    - uses: actions/checkout@v2
     - run: sudo lshw -short
     - run: lscpu | grep 'CPU(s)'
     - run: sudo apt-get install inxi
